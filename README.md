@@ -6,6 +6,8 @@
   My personal Claude assistant that runs securely in containers. Lightweight and built to be understood and customized for your own needs.
 </p>
 
+> **Note**: This is a fork of [gavrielc/nanoclaw](https://github.com/gavrielc/nanoclaw) with performance optimizations and enhanced documentation. See [What's Different](#whats-different-in-this-fork) below.
+
 ## Why I Built This
 
 [OpenClaw](https://github.com/openclaw/openclaw) is an impressive project with a great vision. But I can't sleep well running software I don't understand with access to my life. OpenClaw has 52+ modules, 8 config management files, 45+ dependencies, and abstractions for 15 channel providers. Security is application-level (allowlists, pairing codes) rather than OS isolation. Everything runs in one Node process with shared memory.
@@ -15,12 +17,14 @@ NanoClaw gives you the same core functionality in a codebase you can understand 
 ## Quick Start
 
 ```bash
-git clone https://github.com/gavrielc/nanoclaw.git
+git clone https://github.com/Ring8688/nanoclaw.git
 cd nanoclaw
 claude
 ```
 
 Then run `/setup`. Claude Code handles everything: dependencies, authentication, container setup, service configuration.
+
+**Prefer the upstream version?** Use `https://github.com/gavrielc/nanoclaw.git` instead.
 
 ## Philosophy
 
@@ -37,6 +41,34 @@ Then run `/setup`. Claude Code handles everything: dependencies, authentication,
 **Skills over features.** Contributors shouldn't add features (e.g. support for Telegram) to the codebase. Instead, they contribute [claude code skills](https://code.claude.com/docs/en/skills) like `/add-telegram` that transform your fork. You end up with clean code that does exactly what you need.
 
 **Best harness, best model.** This runs on Claude Agent SDK, which means you're running Claude Code directly. The harness matters. A bad harness makes even smart models seem dumb, a good harness gives them superpowers. Claude Code is (IMO) the best harness available.
+
+## What's Different in This Fork
+
+This fork includes performance optimizations and enhanced documentation:
+
+### Performance Enhancements
+
+**Hybrid Architecture** - Main group uses a persistent container that eliminates 3s startup overhead:
+- **Simple queries**: ~6s response time (40% faster than standard ~10s)
+- **Complex queries**: Still use dedicated containers for safety and isolation
+- **AI-driven routing**: Claude autonomously decides when to use persistent vs dedicated containers
+- **Automatic fallback**: Crashes trigger exponential backoff, then fallback to traditional mode
+- **One-line rollback**: `ENABLE_PERSISTENT_MAIN=false` in `.env` to disable
+
+See `/optimize-performance-hybrid` skill for configuration and troubleshooting.
+
+### Enhanced Documentation
+
+**New Skills**:
+- `/optimize-performance-hybrid` - Configure and troubleshoot the hybrid architecture
+- `/telegram-integration` - Comprehensive Telegram implementation reference
+
+**Contributions**:
+- Performance optimization implementation (persistent containers, AI-driven subagent spawning)
+- Architecture documentation improvements
+- Troubleshooting guides
+
+All enhancements maintain backward compatibility. The fork stays synchronized with upstream security fixes and core improvements.
 
 ## What It Supports
 
@@ -112,14 +144,28 @@ Skills we'd love to see:
 ## Architecture
 
 ```
-Telegram (telegraf) --> SQLite --> Polling loop --> Container (Claude Agent SDK) --> Response
+Telegram (telegraf) --> SQLite --> Polling loop --> Intelligent Router
+                                                           ↓
+                                               ┌───────────┴────────────┐
+                                               ↓                        ↓
+                                    Persistent Container      Dedicated Container
+                                    (Main group, simple)      (Complex queries)
+                                               ↓                        ↓
+                                    Claude Agent SDK --> Response
 ```
 
 Single Node.js process. Agents execute in isolated Linux containers with mounted directories. IPC via filesystem. No daemons, no queues, no complexity.
 
+**Hybrid Architecture** (Main group only):
+- Persistent container handles simple queries (~6s)
+- Dedicated containers for complex operations (~10s)
+- AI decides routing based on query complexity
+- Other groups use traditional on-demand containers
+
 Key files:
-- `src/index.ts` - Main app: Telegram bot, routing, IPC
-- `src/container-runner.ts` - Spawns agent containers
+- `src/index.ts` - Main app: Telegram bot, routing, IPC, intelligent routing
+- `src/main-agent-manager.ts` - Persistent container lifecycle manager
+- `src/container-runner.ts` - Spawns dedicated agent containers
 - `src/task-scheduler.ts` - Runs scheduled tasks
 - `src/db.ts` - SQLite operations
 - `groups/*/CLAUDE.md` - Per-group memory
