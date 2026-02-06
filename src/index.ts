@@ -135,6 +135,7 @@ function getAvailableGroups(): AvailableGroup[] {
 }
 
 async function processMessage(msg: NewMessage): Promise<void> {
+  const startTime = Date.now();
   const group = registeredGroups[msg.chat_jid];
   if (!group) return;
 
@@ -166,34 +167,24 @@ async function processMessage(msg: NewMessage): Promise<void> {
 
   if (!prompt) return;
 
+  const prepTime = Date.now() - startTime;
   logger.info(
-    { group: group.name, messageCount: missedMessages.length },
+    { group: group.name, messageCount: missedMessages.length, prepTime },
     'Processing message',
   );
 
   await setTyping(msg.chat_jid, true);
+  const agentStartTime = Date.now();
   const response = await runAgent(group, prompt, msg.chat_jid);
+  const agentTime = Date.now() - agentStartTime;
   await setTyping(msg.chat_jid, false);
 
   if (response) {
     lastAgentTimestamp[msg.chat_jid] = msg.timestamp;
+    const totalTime = Date.now() - startTime;
+    logger.info({ agentTime, totalTime }, 'Message processing complete');
     await sendMessage(msg.chat_jid, `${ASSISTANT_NAME}: ${response}`);
   }
-}
-
-/**
- * Classify query complexity for intelligent routing
- * Simple queries go to persistent container, complex queries get dedicated container
- */
-function isSimpleQuery(prompt: string): boolean {
-  // Complex query indicators
-  if (prompt.length > 2000) return false; // Too long
-  if (/\/[a-zA-Z0-9_\-./]+/.test(prompt)) return false; // Contains file paths
-  if (/```/.test(prompt)) return false; // Contains code blocks
-  if (/\b(run|execute|install|build|compile)\b/i.test(prompt)) return false; // Operation keywords
-  if (/\b(file|directory|folder|create|delete|modify)\b/i.test(prompt)) return false; // File operations
-
-  return true; // Simple conversational query
 }
 
 async function runAgent(
@@ -229,13 +220,13 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
-  // Smart routing for Main group
+  // Main group: always route to persistent container (AI decides if subagent needed)
   if (isMain && ENABLE_PERSISTENT_MAIN) {
     const manager = getMainAgentManager();
 
-    if (manager && isSimpleQuery(prompt)) {
+    if (manager) {
       try {
-        logger.info('Routing to persistent main agent (simple query)');
+        logger.info('Routing to persistent main agent');
         const response = await manager.query(prompt, sessionId, chatJid);
 
         if (response.newSessionId) {
@@ -247,16 +238,14 @@ async function runAgent(
       } catch (err) {
         logger.error(
           { err },
-          'Persistent agent failed, falling back to traditional container'
+          'Persistent agent failed, falling back to on-demand container'
         );
-        // Fall through to traditional container
+        // Fall through to on-demand container
       }
-    } else if (!isSimpleQuery(prompt)) {
-      logger.info('Complex query detected, spawning dedicated subagent');
     }
   }
 
-  // Traditional container mode (fallback or non-main groups)
+  // On-demand container mode (fallback or non-main groups)
   try {
     const output = await runContainerAgent(group, {
       prompt,
@@ -451,6 +440,9 @@ async function processTaskIpc(
     folder?: string;
     trigger?: string;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For spawn_subagent
+    task?: string;
+    includeContext?: boolean;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -656,6 +648,92 @@ async function processTaskIpc(
         logger.warn(
           { data },
           'Invalid register_group request - missing required fields',
+        );
+      }
+      break;
+
+    case 'spawn_subagent':
+      // Only main group can spawn subagents
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized spawn_subagent attempt blocked',
+        );
+        break;
+      }
+      if (data.task && data.chatJid) {
+        const chatJid = data.chatJid; // Type narrowing
+        const task = data.task;
+        logger.info({ task: task.slice(0, 100) }, 'Spawning subagent from main agent request');
+
+        // Get group info
+        const targetGroup = registeredGroups[chatJid];
+        if (!targetGroup) {
+          logger.warn({ chatJid }, 'Cannot spawn subagent: group not found');
+          break;
+        }
+
+        // Build prompt for subagent
+        let subagentPrompt = task;
+        if (data.includeContext) {
+          // Get recent messages for context
+          const recentMessages = getMessagesSince(
+            chatJid,
+            new Date(Date.now() - 30 * 60 * 1000).toISOString(), // Last 30 minutes
+            ASSISTANT_NAME,
+          ).slice(-10); // Last 10 messages
+
+          if (recentMessages.length > 0) {
+            const escapeXml = (s: string) =>
+              s
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+
+            const contextLines = recentMessages.map((m) =>
+              `<message sender="${escapeXml(m.sender_name)}" time="${m.timestamp}">${escapeXml(m.content)}</message>`
+            );
+            subagentPrompt = `<recent_context>\n${contextLines.join('\n')}\n</recent_context>\n\n${data.task}`;
+          }
+        }
+
+        // Spawn dedicated container (background, non-blocking)
+        (async () => {
+          try {
+            const output = await runContainerAgent(targetGroup, {
+              prompt: subagentPrompt,
+              sessionId: undefined, // Fresh session for subagent
+              groupFolder: targetGroup.folder,
+              chatJid,
+              isMain: true,
+            });
+
+            // Send result back via Telegram
+            if (output.status === 'success' && output.result) {
+              await sendMessage(chatJid, `${ASSISTANT_NAME}: ${output.result}`);
+              logger.info('Subagent completed and result sent');
+            } else {
+              logger.error({ error: output.error }, 'Subagent failed');
+              await sendMessage(
+                chatJid,
+                `${ASSISTANT_NAME}: Subagent encountered an error: ${output.error || 'Unknown error'}`
+              );
+            }
+          } catch (err) {
+            logger.error({ err }, 'Error running subagent');
+            await sendMessage(
+              chatJid,
+              `${ASSISTANT_NAME}: Failed to run subagent: ${err instanceof Error ? err.message : String(err)}`
+            );
+          }
+        })();
+
+        logger.info('Subagent task queued (running in background)');
+      } else {
+        logger.warn(
+          { data },
+          'Invalid spawn_subagent request - missing task or chatJid',
         );
       }
       break;

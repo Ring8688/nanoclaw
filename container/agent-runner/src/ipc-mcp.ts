@@ -315,6 +315,70 @@ Use available_groups.json to find the chat ID. The folder name should be lowerca
             }]
           };
         }
+      ),
+
+      tool(
+        'spawn_subagent',
+        `Spawn a dedicated subagent container for complex tasks that need:
+• File system operations (read/write/modify files)
+• Running bash commands or scripts
+• Installing packages or dependencies
+• Long-running operations
+• Full isolation and dedicated resources
+
+The subagent runs in a dedicated container with the full project mounted. Use this when a task is too complex or risky to handle in the main conversation.
+
+WHEN TO USE:
+• User asks to modify code or files
+• Task requires running commands (npm install, git, etc.)
+• Need to analyze large codebases or multiple files
+• Operations that might fail or have side effects
+• Anything that needs full Claude Code SDK capabilities
+
+WHEN NOT TO USE (handle directly):
+• Simple questions or conversations
+• Information already in your memory (CLAUDE.md)
+• Quick clarifications or explanations
+• Scheduling tasks (use schedule_task instead)
+
+CONTEXT:
+• include_context=true: Pass recent conversation history to subagent (use for tasks that need user's intent/context)
+• include_context=false: Fresh session (use for independent tasks)
+
+The subagent will work independently and return its result. You should then summarize or relay the result to the user.`,
+        {
+          task: z.string().describe('Clear description of what the subagent should do. Be specific about the goal and any constraints.'),
+          include_context: z.boolean().default(false).describe('Whether to pass recent conversation history to the subagent')
+        },
+        async (args) => {
+          if (!isMain) {
+            return {
+              content: [{ type: 'text', text: 'Only the main group can spawn subagents.' }],
+              isError: true
+            };
+          }
+
+          // Send request via IPC file
+          const data = {
+            type: 'spawn_subagent',
+            task: args.task,
+            includeContext: args.include_context,
+            chatJid,
+            groupFolder,
+            timestamp: new Date().toISOString()
+          };
+
+          const filename = writeIpcFile(TASKS_DIR, data);
+
+          // In persistent mode, host will process this and we'll get result
+          // For now, return acknowledgment
+          return {
+            content: [{
+              type: 'text',
+              text: `Subagent task submitted (${filename}). The host will spawn a dedicated container to handle this task.`
+            }]
+          };
+        }
       )
     ]
   });

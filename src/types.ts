@@ -80,13 +80,16 @@ export interface TaskRunLog {
 
 export interface PersistentContainerRequest {
   requestId: string;
-  prompt: string;
+  prompt?: string;
   sessionId?: string;
   groupFolder: string;
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
-  command?: 'query' | 'shutdown' | 'health';
+  command?: 'query' | 'shutdown' | 'health' | 'spawn_subagent';
+  // For spawn_subagent command
+  subagentTask?: string;
+  includeContext?: boolean;
 }
 
 export interface PersistentContainerResponse {

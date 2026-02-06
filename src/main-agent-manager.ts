@@ -89,6 +89,7 @@ export class MainAgentManager extends EventEmitter {
     }
 
     const requestId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const startTime = Date.now();
 
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -111,7 +112,8 @@ export class MainAgentManager extends EventEmitter {
 
       try {
         this.container!.stdin!.write(JSON.stringify(request) + '\n');
-        logger.debug({ requestId }, 'Sent query to persistent container');
+        const sendTime = Date.now() - startTime;
+        logger.info({ requestId, sendTime }, 'Query sent to persistent container');
       } catch (err) {
         clearTimeout(timeout);
         this.pendingRequests.delete(requestId);
@@ -293,6 +295,16 @@ export class MainAgentManager extends EventEmitter {
 
     clearTimeout(pending.timeout);
     this.pendingRequests.delete(response.requestId);
+
+    // Extract timestamp from requestId (req-TIMESTAMP-random)
+    const timestamp = parseInt(response.requestId.split('-')[1]);
+    const responseTime = Date.now() - timestamp;
+
+    logger.info({
+      requestId: response.requestId,
+      responseTime,
+      status: response.status
+    }, 'Received response from persistent container');
 
     if (response.status === 'success') {
       pending.resolve({
