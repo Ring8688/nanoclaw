@@ -41,7 +41,19 @@ export const TRIGGER_PATTERN = new RegExp(
   'i',
 );
 
+export const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+
 // Timezone for scheduled tasks (cron expressions, etc.)
 // Uses system timezone by default
 export const TIMEZONE =
   process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+// Persistent container configuration (hybrid architecture optimization)
+export const ENABLE_PERSISTENT_MAIN =
+  process.env.ENABLE_PERSISTENT_MAIN !== 'false'; // Default: enabled
+
+export const PERSISTENT_HEALTH_CHECK_INTERVAL =
+  parseInt(process.env.PERSISTENT_HEALTH_CHECK_INTERVAL || '30000', 10);
+
+export const PERSISTENT_REQUEST_TIMEOUT =
+  parseInt(process.env.PERSISTENT_REQUEST_TIMEOUT || '300000', 10);

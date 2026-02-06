@@ -1,12 +1,16 @@
 /**
  * NanoClaw Agent Runner
  * Runs inside a container, receives config via stdin, outputs result to stdout
+ * Supports both one-shot mode and persistent mode (for Main group optimization)
  */
 
 import fs from 'fs';
 import path from 'path';
+import readline from 'readline';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { createIpcMcp } from './ipc-mcp.js';
+
+const PERSISTENT_MODE = process.env.NANOCLAW_PERSISTENT === 'true';
 
 interface ContainerInput {
   prompt: string;
@@ -200,22 +204,13 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
   return lines.join('\n');
 }
 
-async function main(): Promise<void> {
-  let input: ContainerInput;
-
-  try {
-    const stdinData = await readStdin();
-    input = JSON.parse(stdinData);
-    log(`Received input for group: ${input.groupFolder}`);
-  } catch (err) {
-    writeOutput({
-      status: 'error',
-      result: null,
-      error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`
-    });
-    process.exit(1);
-  }
-
+/**
+ * Execute a single query (extracted from original main logic)
+ * Used by both one-shot mode and persistent mode
+ */
+async function executeQuery(
+  input: ContainerInput
+): Promise<ContainerOutput> {
   const ipcMcp = createIpcMcp({
     chatJid: input.chatJid,
     groupFolder: input.groupFolder,
@@ -267,22 +262,129 @@ async function main(): Promise<void> {
     }
 
     log('Agent completed successfully');
-    writeOutput({
+    return {
       status: 'success',
       result,
       newSessionId
-    });
+    };
 
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);
-    writeOutput({
+    return {
       status: 'error',
       result: null,
       newSessionId,
       error: errorMessage
+    };
+  }
+}
+
+/**
+ * Persistent mode: keep container running and process queries via stdin/stdout
+ * Main group optimization to eliminate container startup overhead
+ */
+async function runPersistentMode(): Promise<void> {
+  let currentSessionId: string | undefined;
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: false
+  });
+
+  log('Starting persistent mode...');
+
+  rl.on('line', async (line: string) => {
+    try {
+      const request = JSON.parse(line);
+
+      // Health check
+      if (request.command === 'health') {
+        console.log(JSON.stringify({
+          requestId: request.requestId,
+          status: 'success',
+          result: 'healthy'
+        }));
+        return;
+      }
+
+      // Shutdown command
+      if (request.command === 'shutdown') {
+        log('Shutdown requested');
+        process.exit(0);
+      }
+
+      // Execute query
+      const output = await executeQuery({
+        prompt: request.prompt,
+        sessionId: currentSessionId || request.sessionId,
+        groupFolder: request.groupFolder,
+        chatJid: request.chatJid,
+        isMain: request.isMain,
+        isScheduledTask: request.isScheduledTask
+      });
+
+      // Maintain session across queries
+      if (output.newSessionId) {
+        currentSessionId = output.newSessionId;
+      }
+
+      // Send response
+      console.log(JSON.stringify({
+        requestId: request.requestId,
+        status: output.status,
+        result: output.result,
+        newSessionId: output.newSessionId,
+        error: output.error
+      }));
+    } catch (err) {
+      console.log(JSON.stringify({
+        requestId: 'unknown',
+        status: 'error',
+        result: null,
+        error: err instanceof Error ? err.message : String(err)
+      }));
+    }
+  });
+
+  // Keep process alive
+  await new Promise(() => {});
+}
+
+/**
+ * One-shot mode: execute single query and exit (legacy behavior)
+ */
+async function runOneShotMode(): Promise<void> {
+  let input: ContainerInput;
+
+  try {
+    const stdinData = await readStdin();
+    input = JSON.parse(stdinData);
+    log(`Received input for group: ${input.groupFolder}`);
+  } catch (err) {
+    writeOutput({
+      status: 'error',
+      result: null,
+      error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`
     });
     process.exit(1);
+  }
+
+  const output = await executeQuery(input);
+
+  writeOutput(output);
+
+  if (output.status === 'error') {
+    process.exit(1);
+  }
+}
+
+async function main(): Promise<void> {
+  if (PERSISTENT_MODE) {
+    await runPersistentMode();
+  } else {
+    await runOneShotMode();
   }
 }
 

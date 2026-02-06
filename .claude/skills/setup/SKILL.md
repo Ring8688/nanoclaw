@@ -1,11 +1,11 @@
 ---
 name: setup
-description: Run initial NanoClaw setup. Use when user wants to install dependencies, authenticate WhatsApp, register their main channel, or start the background services. Triggers on "setup", "install", "configure nanoclaw", or first-time setup requests.
+description: Run initial NanoClaw setup. Use when user wants to install dependencies, configure Telegram bot, register their main channel, or start the background services. Triggers on "setup", "install", "configure nanoclaw", or first-time setup requests.
 ---
 
 # NanoClaw Setup
 
-Run all commands automatically. Only pause when user action is required (scanning QR codes).
+Run all commands automatically. Only pause when user action is required (e.g., creating a bot token).
 
 **UX Note:** When asking the user questions, prefer using the `AskUserQuestion` tool instead of just outputting text. This integrates with Claude's built-in question/answer system for a better experience.
 
@@ -15,63 +15,21 @@ Run all commands automatically. Only pause when user action is required (scannin
 npm install
 ```
 
-## 2. Install Container Runtime
+## 2. Verify Docker
 
-First, detect the platform and check what's available:
-
-```bash
-echo "Platform: $(uname -s)"
-which container && echo "Apple Container: installed" || echo "Apple Container: not installed"
-which docker && docker info >/dev/null 2>&1 && echo "Docker: installed and running" || echo "Docker: not installed or not running"
-```
-
-### If NOT on macOS (Linux, etc.)
-
-Apple Container is macOS-only. Use Docker instead.
-
-Tell the user:
-> You're on Linux, so we'll use Docker for container isolation. Let me set that up now.
-
-**Use the `/convert-to-docker` skill** to convert the codebase to Docker, then continue to Section 3.
-
-### If on macOS
-
-**If Apple Container is already installed:** Continue to Section 3.
-
-**If Apple Container is NOT installed:** Ask the user:
-> NanoClaw needs a container runtime for isolated agent execution. You have two options:
->
-> 1. **Apple Container** (default) - macOS-native, lightweight, designed for Apple silicon
-> 2. **Docker** - Cross-platform, widely used, works on macOS and Linux
->
-> Which would you prefer?
-
-#### Option A: Apple Container
-
-Tell the user:
-> Apple Container is required for running agents in isolated environments.
->
-> 1. Download the latest `.pkg` from https://github.com/apple/container/releases
-> 2. Double-click to install
-> 3. Run `container system start` to start the service
->
-> Let me know when you've completed these steps.
-
-Wait for user confirmation, then verify:
+Check Docker is available:
 
 ```bash
-container system start
-container --version
+docker info >/dev/null 2>&1 && echo "Docker: installed and running" || echo "Docker: not installed or not running"
 ```
 
-**Note:** NanoClaw automatically starts the Apple Container system when it launches, so you don't need to start it manually after reboots.
-
-#### Option B: Docker
-
-Tell the user:
-> You've chosen Docker. Let me set that up now.
-
-**Use the `/convert-to-docker` skill** to convert the codebase to Docker, then continue to Section 3.
+If Docker is not running, tell the user:
+> Docker is required for running agents in isolated containers.
+>
+> Install from: https://docker.com/products/docker-desktop
+> On Linux: `sudo apt install docker.io && sudo systemctl start docker`
+>
+> Let me know when Docker is ready.
 
 ## 3. Configure Claude Authentication
 
@@ -99,11 +57,6 @@ echo "CLAUDE_CODE_OAUTH_TOKEN=<token>" > .env
 
 Ask if they have an existing key to copy or need to create one.
 
-**Copy existing:**
-```bash
-grep "^ANTHROPIC_API_KEY=" /path/to/source/.env > .env
-```
-
 **Create new:**
 ```bash
 echo 'ANTHROPIC_API_KEY=' > .env
@@ -117,7 +70,33 @@ KEY=$(grep "^ANTHROPIC_API_KEY=" .env | cut -d= -f2)
 [ -n "$KEY" ] && echo "API key configured: ${KEY:0:10}...${KEY: -4}" || echo "Missing"
 ```
 
-## 4. Build Container Image
+## 4. Configure Telegram Bot
+
+**USER ACTION REQUIRED**
+
+Tell the user:
+> You need a Telegram bot token from BotFather:
+>
+> 1. Open Telegram and search for **@BotFather**
+> 2. Send `/newbot` and follow the prompts
+> 3. Copy the bot token (looks like `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`)
+> 4. Paste the token here
+
+Once they provide the token, add it to `.env`:
+
+```bash
+echo "TELEGRAM_BOT_TOKEN=<token>" >> .env
+```
+
+Tell the user:
+> Also, configure your bot's privacy settings so it can read group messages:
+>
+> 1. In BotFather, send `/mybots`
+> 2. Select your bot → **Bot Settings** → **Group Privacy** → **Turn off**
+>
+> This allows the bot to see all messages in groups it's added to.
+
+## 5. Build Container Image
 
 Build the NanoClaw agent container:
 
@@ -127,35 +106,11 @@ Build the NanoClaw agent container:
 
 This creates the `nanoclaw-agent:latest` image with Node.js, Chromium, Claude Code CLI, and agent-browser.
 
-Verify the build succeeded by running a simple test (this auto-detects which runtime you're using):
+Verify the build:
 
 ```bash
-if which docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-  echo '{}' | docker run -i --entrypoint /bin/echo nanoclaw-agent:latest "Container OK" || echo "Container build failed"
-else
-  echo '{}' | container run -i --entrypoint /bin/echo nanoclaw-agent:latest "Container OK" || echo "Container build failed"
-fi
+echo '{}' | docker run -i --entrypoint /bin/echo nanoclaw-agent:latest "Container OK" || echo "Container build failed"
 ```
-
-## 5. WhatsApp Authentication
-
-**USER ACTION REQUIRED**
-
-Run the authentication script:
-
-```bash
-npm run auth
-```
-
-Tell the user:
-> A QR code will appear. On your phone:
-> 1. Open WhatsApp
-> 2. Tap **Settings → Linked Devices → Link a Device**
-> 3. Scan the QR code
-
-Wait for the script to output "Successfully authenticated" then continue.
-
-If it says "Already authenticated", skip to the next step.
 
 ## 6. Configure Assistant Name
 
@@ -185,59 +140,37 @@ Before registering your main channel, you need to understand an important securi
 > - Can write to global memory that all groups can read
 > - Has read-write access to the entire NanoClaw project
 >
-> **Recommendation:** Use your personal "Message Yourself" chat or a solo WhatsApp group as your main channel. This ensures only you have admin control.
+> **Recommendation:** Use a private chat with the bot as your main channel. This ensures only you have admin control.
 >
 > **Question:** Which setup will you use for your main channel?
 >
 > Options:
-> 1. Personal chat (Message Yourself) - Recommended
-> 2. Solo WhatsApp group (just me)
-> 3. Group with other people (I understand the security implications)
+> 1. Private chat with bot (just you and the bot) - Recommended
+> 2. Telegram group (I understand the security implications)
 
-If they choose option 3, ask a follow-up:
-
-> You've chosen a group with other people. This means everyone in that group will have admin privileges over NanoClaw.
->
-> Are you sure you want to proceed? The other members will be able to:
-> - Read messages from your other registered chats
-> - Schedule and manage tasks
-> - Access any directories you've mounted
->
-> Options:
-> 1. Yes, I understand and want to proceed
-> 2. No, let me use a personal chat or solo group instead
+If they choose a group, ask a follow-up about security implications.
 
 ## 8. Register Main Channel
 
-Ask the user:
-> Do you want to use your **personal chat** (message yourself) or a **WhatsApp group** as your main control channel?
+Tell the user:
+> Send any message to the bot in a private chat (or in the Telegram group you want to use as your main channel).
 
-For personal chat:
-> Send any message to yourself in WhatsApp (the "Message Yourself" chat). Tell me when done.
-
-For group:
-> Send any message in the WhatsApp group you want to use as your main channel. Tell me when done.
-
-After user confirms, start the app briefly to capture the message:
+Start the app briefly to capture the message:
 
 ```bash
 timeout 10 npm run dev || true
 ```
 
-Then find the JID from the database:
+Then find the chat ID from the database:
 
 ```bash
-# For personal chat (ends with @s.whatsapp.net)
-sqlite3 store/messages.db "SELECT DISTINCT chat_jid FROM messages WHERE chat_jid LIKE '%@s.whatsapp.net' ORDER BY timestamp DESC LIMIT 5"
-
-# For group (ends with @g.us)
-sqlite3 store/messages.db "SELECT DISTINCT chat_jid FROM messages WHERE chat_jid LIKE '%@g.us' ORDER BY timestamp DESC LIMIT 5"
+sqlite3 store/messages.db "SELECT jid, name, last_message_time FROM chats ORDER BY last_message_time DESC LIMIT 5"
 ```
 
-Create/update `data/registered_groups.json` using the JID from above and the assistant name from step 5:
+Create/update `data/registered_groups.json` using the chat ID from above and the assistant name from step 6:
 ```json
 {
-  "JID_HERE": {
+  "CHAT_ID_HERE": {
     "name": "main",
     "folder": "main",
     "trigger": "@ASSISTANT_NAME",
@@ -260,7 +193,7 @@ Ask the user:
 >
 > **Note:** This is optional. Without configuration, agents can only access their own group folders.
 
-If **no**, create an empty allowlist to make this explicit:
+If **no**, create an empty allowlist:
 
 ```bash
 mkdir -p ~/.config/nanoclaw
@@ -271,96 +204,54 @@ cat > ~/.config/nanoclaw/mount-allowlist.json << 'EOF'
   "nonMainReadOnly": true
 }
 EOF
-echo "Mount allowlist created - no external directories allowed"
 ```
 
-Skip to the next step.
+If **yes**, collect directory paths and create the allowlist JSON accordingly.
 
-If **yes**, ask follow-up questions:
+## 10. Configure systemd Service (Linux) or launchd (macOS)
 
-### 9a. Collect Directory Paths
-
-Ask the user:
-> Which directories do you want to allow access to?
->
-> You can specify:
-> - A parent folder like `~/projects` (allows access to anything inside)
-> - Specific paths like `~/repos/my-app`
->
-> List them one per line, or give me a comma-separated list.
-
-For each directory they provide, ask:
-> Should `[directory]` be **read-write** (agents can modify files) or **read-only**?
->
-> Read-write is needed for: code changes, creating files, git commits
-> Read-only is safer for: reference docs, config examples, templates
-
-### 9b. Configure Non-Main Group Access
-
-Ask the user:
-> Should **non-main groups** (other WhatsApp chats you add later) be restricted to **read-only** access even if read-write is allowed for the directory?
->
-> Recommended: **Yes** - this prevents other groups from modifying files even if you grant them access to a directory.
-
-### 9c. Create the Allowlist
-
-Create the allowlist file based on their answers:
+Build first:
 
 ```bash
-mkdir -p ~/.config/nanoclaw
+npm run build
+mkdir -p logs
 ```
 
-Then write the JSON file. Example for a user who wants `~/projects` (read-write) and `~/docs` (read-only) with non-main read-only:
+### Linux (systemd)
 
 ```bash
-cat > ~/.config/nanoclaw/mount-allowlist.json << 'EOF'
-{
-  "allowedRoots": [
-    {
-      "path": "~/projects",
-      "allowReadWrite": true,
-      "description": "Development projects"
-    },
-    {
-      "path": "~/docs",
-      "allowReadWrite": false,
-      "description": "Reference documents"
-    }
-  ],
-  "blockedPatterns": [],
-  "nonMainReadOnly": true
-}
+NODE_PATH=$(which node)
+PROJECT_PATH=$(pwd)
+
+sudo tee /etc/systemd/system/nanoclaw.service << EOF
+[Unit]
+Description=NanoClaw Personal Assistant
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=${PROJECT_PATH}
+ExecStart=${NODE_PATH} ${PROJECT_PATH}/dist/index.js
+Restart=always
+RestartSec=10
+Environment=HOME=$HOME
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin
+
+StandardOutput=append:${PROJECT_PATH}/logs/nanoclaw.log
+StandardError=append:${PROJECT_PATH}/logs/nanoclaw.error.log
+
+[Install]
+WantedBy=multi-user.target
 EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable nanoclaw
+sudo systemctl start nanoclaw
 ```
 
-Verify the file:
-
-```bash
-cat ~/.config/nanoclaw/mount-allowlist.json
-```
-
-Tell the user:
-> Mount allowlist configured. The following directories are now accessible:
-> - `~/projects` (read-write)
-> - `~/docs` (read-only)
->
-> **Security notes:**
-> - Sensitive paths (`.ssh`, `.gnupg`, `.aws`, credentials) are always blocked
-> - This config file is stored outside the project, so agents cannot modify it
-> - Changes require restarting the NanoClaw service
->
-> To grant a group access to a directory, add it to their config in `data/registered_groups.json`:
-> ```json
-> "containerConfig": {
->   "additionalMounts": [
->     { "hostPath": "~/projects/my-app", "containerPath": "my-app", "readonly": false }
->   ]
-> }
-> ```
-
-## 10. Configure launchd Service
-
-Generate the plist file with correct paths automatically:
+### macOS (launchd)
 
 ```bash
 NODE_PATH=$(which node)
@@ -400,21 +291,15 @@ cat > ~/Library/LaunchAgents/com.nanoclaw.plist << EOF
 </plist>
 EOF
 
-echo "Created launchd plist with:"
-echo "  Node: ${NODE_PATH}"
-echo "  Project: ${PROJECT_PATH}"
-```
-
-Build and start the service:
-
-```bash
-npm run build
-mkdir -p logs
 launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist
 ```
 
 Verify it's running:
 ```bash
+# Linux
+sudo systemctl status nanoclaw
+
+# macOS
 launchctl list | grep nanoclaw
 ```
 
@@ -428,29 +313,21 @@ Check the logs:
 tail -f logs/nanoclaw.log
 ```
 
-The user should receive a response in WhatsApp.
+The user should receive a response in Telegram.
 
 ## Troubleshooting
 
 **Service not starting**: Check `logs/nanoclaw.error.log`
 
 **Container agent fails with "Claude Code process exited with code 1"**:
-- Ensure the container runtime is running:
-  - Apple Container: `container system start`
-  - Docker: `docker info` (start Docker Desktop on macOS, or `sudo systemctl start docker` on Linux)
+- Ensure Docker is running: `docker info`
 - Check container logs: `cat groups/main/logs/container-*.log | tail -50`
 
 **No response to messages**:
 - Verify the trigger pattern matches (e.g., `@AssistantName` at start of message)
-- Check that the chat JID is in `data/registered_groups.json`
+- Check that the chat ID is in `data/registered_groups.json`
 - Check `logs/nanoclaw.log` for errors
 
-**WhatsApp disconnected**:
-- The service will show a macOS notification
-- Run `npm run auth` to re-authenticate
-- Restart the service: `launchctl kickstart -k gui/$(id -u)/com.nanoclaw`
-
-**Unload service**:
-```bash
-launchctl unload ~/Library/LaunchAgents/com.nanoclaw.plist
-```
+**Bot not receiving group messages**:
+- Ensure Group Privacy is turned OFF in BotFather settings
+- Make sure the bot is added to the group as a member

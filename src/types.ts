@@ -77,3 +77,22 @@ export interface TaskRunLog {
   result: string | null;
   error: string | null;
 }
+
+export interface PersistentContainerRequest {
+  requestId: string;
+  prompt: string;
+  sessionId?: string;
+  groupFolder: string;
+  chatJid: string;
+  isMain: boolean;
+  isScheduledTask?: boolean;
+  command?: 'query' | 'shutdown' | 'health';
+}
+
+export interface PersistentContainerResponse {
+  requestId: string;
+  status: 'success' | 'error';
+  result: string | null;
+  newSessionId?: string;
+  error?: string;
+}

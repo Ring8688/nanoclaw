@@ -20,11 +20,11 @@ The entire codebase should be something you can read and understand. One Node.js
 
 ### Security Through True Isolation
 
-Instead of application-level permission systems trying to prevent agents from accessing things, agents run in actual Linux containers (Apple Container). The isolation is at the OS level. Agents can only see what's explicitly mounted. Bash access is safe because commands run inside the container, not on your Mac.
+Instead of application-level permission systems trying to prevent agents from accessing things, agents run in actual Docker containers. The isolation is at the OS level. Agents can only see what's explicitly mounted. Bash access is safe because commands run inside the container, not on your host.
 
 ### Built for One User
 
-This isn't a framework or a platform. It's working software for my specific needs. I use WhatsApp and Email, so it supports WhatsApp and Email. I don't use Telegram, so it doesn't support Telegram. I add the integrations I actually want, not every possible integration.
+This isn't a framework or a platform. It's working software for my specific needs. I use Telegram, so it supports Telegram. I add the integrations I actually want, not every possible integration.
 
 ### Customization = Code Changes
 
@@ -38,7 +38,7 @@ The codebase assumes you have an AI collaborator. It doesn't need to be excessiv
 
 ### Skills Over Features
 
-When people contribute, they shouldn't add "Telegram support alongside WhatsApp." They should contribute a skill like `/add-telegram` that transforms the codebase. Users fork the repo, run skills to customize, and end up with clean code that does exactly what they need - not a bloated system trying to support everyone's use case simultaneously.
+When people contribute, they shouldn't add "Slack support alongside Telegram." They should contribute a skill like `/add-slack` that transforms the codebase. Users fork the repo, run skills to customize, and end up with clean code that does exactly what they need - not a bloated system trying to support everyone's use case simultaneously.
 
 ---
 
@@ -48,38 +48,36 @@ Skills we'd love contributors to build:
 
 ### Communication Channels
 Skills to add or switch to different messaging platforms:
-- `/add-telegram` - Add Telegram as an input channel
+- `/add-whatsapp` - Add WhatsApp as an input channel
 - `/add-slack` - Add Slack as an input channel
 - `/add-discord` - Add Discord as an input channel
 - `/add-sms` - Add SMS via Twilio or similar
-- `/convert-to-telegram` - Replace WhatsApp with Telegram entirely
+- `/convert-to-whatsapp` - Replace Telegram with WhatsApp
 
 ### Container Runtime
-The project currently uses Apple Container (macOS-only). We need:
-- `/convert-to-docker` - Replace Apple Container with standard Docker
-- This unlocks Linux support and broader deployment options
+The project uses Docker for cross-platform container isolation.
 
 ### Platform Support
-- `/setup-linux` - Make the full setup work on Linux (depends on Docker conversion)
+- `/setup-linux` - Linux-specific setup optimizations
 - `/setup-windows` - Windows support via WSL2 + Docker
 
 ---
 
 ## Vision
 
-A personal Claude assistant accessible via WhatsApp, with minimal custom code.
+A personal Claude assistant accessible via Telegram, with minimal custom code.
 
 **Core components:**
 - **Claude Agent SDK** as the core agent
-- **Apple Container** for isolated agent execution (Linux VMs)
-- **WhatsApp** as the primary I/O channel
+- **Docker** for isolated agent execution
+- **Telegram** as the primary I/O channel
 - **Persistent memory** per conversation and globally
 - **Scheduled tasks** that run Claude and can message back
 - **Web access** for search and browsing
 - **Browser automation** via agent-browser
 
 **Implementation approach:**
-- Use existing tools (WhatsApp connector, Claude Agent SDK, MCP servers)
+- Use existing tools (Telegram connector, Claude Agent SDK, MCP servers)
 - Minimal glue code
 - File-based systems where possible (CLAUDE.md for memory, folders for groups)
 
@@ -88,7 +86,7 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 ## Architecture Decisions
 
 ### Message Routing
-- A router listens to WhatsApp and routes messages based on configuration
+- A router listens to Telegram and routes messages based on configuration
 - Only messages from registered groups are processed
 - Trigger: `@Andy` prefix (case insensitive), configurable via `ASSISTANT_NAME` env var
 - Unregistered groups are ignored completely
@@ -104,7 +102,7 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 - Sessions auto-compact when context gets too long, preserving critical information
 
 ### Container Isolation
-- All agents run inside Apple Container (lightweight Linux VMs)
+- All agents run inside Docker (lightweight Linux VMs)
 - Each agent invocation spawns a container with mounted directories
 - Containers provide filesystem isolation - agents can only see mounted paths
 - Bash access is safe because commands run inside the container, not on the host
@@ -137,10 +135,10 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 
 ## Integration Points
 
-### WhatsApp
-- Using baileys library for WhatsApp Web connection
+### Telegram
+- Using telegraf library for Telegram Bot API
+- Bot token authentication via TELEGRAM_BOT_TOKEN env var
 - Messages stored in SQLite, polled by router
-- QR code authentication during setup
 
 ### Scheduler
 - Built-in scheduler runs on the host, spawns containers for task execution
@@ -171,7 +169,7 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 - Each user gets a custom setup matching their exact needs
 
 ### Skills
-- `/setup` - Install dependencies, authenticate WhatsApp, configure scheduler, start services
+- `/setup` - Install dependencies, configure Telegram bot, configure scheduler, start services
 - `/customize` - General-purpose skill for adding capabilities (new channels like Telegram, new integrations, behavior changes)
 
 ### Deployment
@@ -187,7 +185,7 @@ These are the creator's settings, stored here for reference:
 - **Trigger**: `@Andy` (case insensitive)
 - **Response prefix**: `Andy:`
 - **Persona**: Default Claude (no custom personality)
-- **Main channel**: Self-chat (messaging yourself in WhatsApp)
+- **Main channel**: Self-chat (messaging yourself in Telegram)
 
 ---
 

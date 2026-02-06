@@ -1,6 +1,6 @@
 # NanoClaw Specification
 
-A personal Claude assistant accessible via WhatsApp, with persistent memory per conversation, scheduled tasks, and email integration.
+A personal Claude assistant accessible via Telegram, with persistent memory per conversation, scheduled tasks, and email integration.
 
 ---
 
@@ -24,13 +24,13 @@ A personal Claude assistant accessible via WhatsApp, with persistent memory per 
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                        HOST (macOS)                                  │
+│                     HOST (macOS/Linux)                                │
 │                   (Main Node.js Process)                             │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                      │
 │  ┌──────────────┐                     ┌────────────────────┐        │
-│  │  WhatsApp    │────────────────────▶│   SQLite Database  │        │
-│  │  (baileys)   │◀────────────────────│   (messages.db)    │        │
+│  │  Telegram    │────────────────────▶│   SQLite Database  │        │
+│  │  (telegraf)   │◀────────────────────│   (messages.db)    │        │
 │  └──────────────┘   store/send        └─────────┬──────────┘        │
 │                                                  │                   │
 │         ┌────────────────────────────────────────┘                   │
@@ -45,7 +45,7 @@ A personal Claude assistant accessible via WhatsApp, with persistent memory per 
 │                       │ spawns container                             │
 │                       ▼                                              │
 ├─────────────────────────────────────────────────────────────────────┤
-│                  APPLE CONTAINER (Linux VM)                          │
+│                  DOCKER CONTAINER                                    │
 ├─────────────────────────────────────────────────────────────────────┤
 │  ┌──────────────────────────────────────────────────────────────┐   │
 │  │                    AGENT RUNNER                               │   │
@@ -73,9 +73,9 @@ A personal Claude assistant accessible via WhatsApp, with persistent memory per 
 
 | Component | Technology | Purpose |
 |-----------|------------|---------|
-| WhatsApp Connection | Node.js (@whiskeysockets/baileys) | Connect to WhatsApp, send/receive messages |
+| Telegram Bot | Node.js (telegraf) | Connect to Telegram Bot API, send/receive messages |
 | Message Storage | SQLite (better-sqlite3) | Store messages for polling |
-| Container Runtime | Apple Container | Isolated Linux VMs for agent execution |
+| Container Runtime | Docker | Isolated containers for agent execution |
 | Agent | @anthropic-ai/claude-agent-sdk (0.2.29) | Run Claude with tools and MCP servers |
 | Browser Automation | agent-browser + Chromium | Web interaction and screenshots |
 | Runtime | Node.js 20+ | Host process for routing and scheduling |
@@ -98,14 +98,13 @@ nanoclaw/
 ├── .gitignore
 │
 ├── src/
-│   ├── index.ts                   # Main application (WhatsApp + routing)
+│   ├── index.ts                   # Main application (Telegram + routing)
 │   ├── config.ts                  # Configuration constants
 │   ├── types.ts                   # TypeScript interfaces
 │   ├── utils.ts                   # Generic utility functions
 │   ├── db.ts                      # Database initialization and queries
-│   ├── whatsapp-auth.ts           # Standalone WhatsApp authentication
 │   ├── task-scheduler.ts          # Runs scheduled tasks when due
-│   └── container-runner.ts        # Spawns agents in Apple Containers
+│   └── container-runner.ts        # Spawns agents in Docker containers
 │
 ├── container/
 │   ├── Dockerfile                 # Container image (runs as 'node' user, includes Claude Code CLI)
@@ -141,7 +140,7 @@ nanoclaw/
 │       └── *.md                   # Files created by the agent
 │
 ├── store/                         # Local data (gitignored)
-│   ├── auth/                      # WhatsApp authentication state
+│   ├── auth/                      # (unused, can be removed)
 │   └── messages.db                # SQLite database (messages, scheduled_tasks, task_run_logs)
 │
 ├── data/                          # Application state (gitignored)
@@ -187,7 +186,7 @@ export const IPC_POLL_INTERVAL = 1000;
 export const TRIGGER_PATTERN = new RegExp(`^@${ASSISTANT_NAME}\\b`, 'i');
 ```
 
-**Note:** Paths must be absolute for Apple Container volume mounts to work correctly.
+**Note:** Paths must be absolute for Docker volume mounts to work correctly.
 
 ### Container Configuration
 
@@ -216,7 +215,7 @@ Groups can have additional directories mounted via `containerConfig` in `data/re
 
 Additional mounts appear at `/workspace/extra/{containerPath}` inside the container.
 
-**Apple Container mount syntax note:** Read-write mounts use `-v host:container`, but readonly mounts require `--mount "type=bind,source=...,target=...,readonly"` (the `:ro` suffix doesn't work).
+**Docker mount syntax:** Read-write mounts use `-v host:container`, readonly mounts use `-v host:container:ro`.
 
 ### Claude Authentication
 
@@ -233,7 +232,7 @@ The token can be extracted from `~/.claude/.credentials.json` if you're logged i
 ANTHROPIC_API_KEY=sk-ant-api03-...
 ```
 
-Only the authentication variables (`CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY`) are extracted from `.env` and mounted into the container at `/workspace/env-dir/env`, then sourced by the entrypoint script. This ensures other environment variables in `.env` are not exposed to the agent. This workaround is needed because Apple Container loses `-e` environment variables when using `-i` (interactive mode with piped stdin).
+Only the authentication variables (`CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY`) are extracted from `.env` and mounted into the container at `/workspace/env-dir/env`, then sourced by the entrypoint script. This ensures other environment variables in `.env` are not exposed to the agent. This workaround is needed because Docker loses `-e` environment variables when using `-i` (interactive mode with piped stdin).
 
 ### Changing the Assistant Name
 
@@ -314,10 +313,10 @@ Sessions enable conversation continuity - Claude remembers what you talked about
 ### Incoming Message Flow
 
 ```
-1. User sends WhatsApp message
+1. User sends Telegram message
    │
    ▼
-2. Baileys receives message via WhatsApp Web protocol
+2. Telegraf receives message via Telegram Bot API
    │
    ▼
 3. Message stored in SQLite (store/messages.db)
@@ -349,7 +348,7 @@ Sessions enable conversation continuity - Claude remembers what you talked about
    └── Uses tools as needed (search, email, etc.)
    │
    ▼
-9. Router prefixes response with assistant name and sends via WhatsApp
+9. Router prefixes response with assistant name and sends via Telegram Bot API
    │
    ▼
 10. Router updates last agent timestamp and saves session ID
@@ -473,7 +472,7 @@ The `nanoclaw` MCP server is created dynamically per agent call with the current
 | `pause_task` | Pause a task |
 | `resume_task` | Resume a paused task |
 | `cancel_task` | Delete a task |
-| `send_message` | Send a WhatsApp message to the group |
+| `send_message` | Send a message to the Telegram chat |
 
 ---
 
@@ -484,10 +483,10 @@ NanoClaw runs as a single macOS launchd service.
 ### Startup Sequence
 
 When NanoClaw starts, it:
-1. **Ensures Apple Container system is running** - Automatically starts it if needed (survives reboots)
+1. **Ensures Docker is running** - Checks Docker daemon is available
 2. Initializes the SQLite database
 3. Loads state (registered groups, sessions, router state)
-4. Connects to WhatsApp
+4. Connects to Telegram
 5. Starts the message polling loop
 6. Starts the scheduler loop
 7. Starts the IPC watcher for container messages
@@ -555,7 +554,7 @@ tail -f logs/nanoclaw.log
 
 ### Container Isolation
 
-All agents run inside Apple Container (lightweight Linux VMs), providing:
+All agents run inside Docker (lightweight Linux VMs), providing:
 - **Filesystem isolation**: Agents can only access mounted directories
 - **Safe Bash access**: Commands run inside the container, not on your Mac
 - **Network isolation**: Can be configured per-container if needed
@@ -564,7 +563,7 @@ All agents run inside Apple Container (lightweight Linux VMs), providing:
 
 ### Prompt Injection Risk
 
-WhatsApp messages could contain malicious instructions attempting to manipulate Claude's behavior.
+Telegram messages could contain malicious instructions attempting to manipulate Claude's behavior.
 
 **Mitigations:**
 - Container isolation limits blast radius
@@ -585,7 +584,7 @@ WhatsApp messages could contain malicious instructions attempting to manipulate 
 | Credential | Storage Location | Notes |
 |------------|------------------|-------|
 | Claude CLI Auth | data/sessions/{group}/.claude/ | Per-group isolation, mounted to /home/node/.claude/ |
-| WhatsApp Session | store/auth/ | Auto-created, persists ~20 days |
+| Telegram Bot Token | .env file | Set via TELEGRAM_BOT_TOKEN env var |
 
 ### File Permissions
 
@@ -603,11 +602,11 @@ chmod 700 groups/
 | Issue | Cause | Solution |
 |-------|-------|----------|
 | No response to messages | Service not running | Check `launchctl list | grep nanoclaw` |
-| "Claude Code process exited with code 1" | Apple Container failed to start | Check logs; NanoClaw auto-starts container system but may fail |
+| "Claude Code process exited with code 1" | Docker failed to start | Check logs; NanoClaw auto-starts container system but may fail |
 | "Claude Code process exited with code 1" | Session mount path wrong | Ensure mount is to `/home/node/.claude/` not `/root/.claude/` |
 | Session not continuing | Session ID not saved | Check `data/sessions.json` |
 | Session not continuing | Mount path mismatch | Container user is `node` with HOME=/home/node; sessions must be at `/home/node/.claude/` |
-| "QR code expired" | WhatsApp session expired | Delete store/auth/ and restart |
+| "TELEGRAM_BOT_TOKEN is not set" | Missing bot token | Add token to .env |
 | "No groups registered" | Haven't added groups | Use `@Andy add group "Name"` in main |
 
 ### Log Location

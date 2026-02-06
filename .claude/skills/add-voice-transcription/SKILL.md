@@ -1,11 +1,11 @@
 ---
 name: add-voice-transcription
-description: Add voice message transcription to NanoClaw using OpenAI's Whisper API. Automatically transcribes WhatsApp voice notes so the agent can read and respond to them.
+description: Add voice message transcription to NanoClaw using OpenAI's Whisper API. Automatically transcribes Telegram voice notes so the agent can read and respond to them.
 ---
 
 # Add Voice Message Transcription
 
-This skill adds automatic voice message transcription using OpenAI's Whisper API. When users send voice notes in WhatsApp, they'll be transcribed and the agent can read and respond to the content.
+This skill adds automatic voice message transcription using OpenAI's Whisper API. When users send voice notes in Telegram, they'll be transcribed and the agent can read and respond to the content.
 
 **UX Note:** When asking the user questions, prefer using the `AskUserQuestion` tool instead of just outputting text. This integrates with Claude's built-in question/answer system for a better experience.
 
@@ -339,7 +339,7 @@ Tell the user:
 
 > Voice transcription is ready! Test it by:
 >
-> 1. Open WhatsApp on your phone
+> 1. Open Telegram on your phone
 > 2. Go to a registered group chat
 > 3. Send a voice note using the microphone button
 > 4. The agent should receive the transcribed text and respond
