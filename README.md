@@ -57,16 +57,27 @@ This fork includes performance optimizations and enhanced documentation:
 
 See `/optimize-performance-hybrid` skill for configuration and troubleshooting.
 
+### Subagent System
+
+**Full subagent lifecycle management** - When the persistent Main agent spawns subagents for complex tasks:
+- **Result feedback**: Subagent results stored in DB and auto-injected into persistent agent's next prompt, so it can answer "what did that task do?"
+- **Typing indicator**: Users see typing animation while subagents execute (5s-300s)
+- **Cancellation**: Message merge within 3s window aborts running subagents via `docker stop`
+- **Session continuity**: Subagents share the group's session chain instead of starting fresh
+- **Concurrency limit**: Max 3 concurrent subagents (configurable via `MAX_CONCURRENT_SUBAGENTS`)
+
+See `/subagent-improvements` skill for architecture details and verification steps.
+
 ### Enhanced Documentation
 
-**New Skills**:
+**Skills**:
 - `/optimize-performance-hybrid` - Configure and troubleshoot the hybrid architecture
-- `/telegram-integration` - Comprehensive Telegram implementation reference
+- `/subagent-improvements` - Subagent result feedback, cancellation, concurrency management
 
 **Contributions**:
 - Performance optimization implementation (persistent containers, AI-driven subagent spawning)
+- Subagent lifecycle management (result storage, typing, cancellation, session, concurrency)
 - Architecture documentation improvements
-- Troubleshooting guides
 
 All enhancements maintain backward compatibility. The fork stays synchronized with upstream security fixes and core improvements.
 
@@ -76,6 +87,7 @@ All enhancements maintain backward compatibility. The fork stays synchronized wi
 - **Isolated group context** - Each group has its own `CLAUDE.md` memory, isolated filesystem, and runs in its own container sandbox with only that filesystem mounted
 - **Main channel** - Your private chat with the bot for admin control; every other group is completely isolated
 - **Hybrid architecture** - Main group uses persistent container for 40% faster responses (~6s vs ~10s), complex queries still get dedicated containers
+- **Subagent management** - Result feedback to persistent agent, typing indicators, cancellation, session continuity, concurrency limits
 - **Scheduled tasks** - Recurring jobs that run Claude and can message you back
 - **Web access** - Search and fetch content
 - **Container isolation** - Agents sandboxed in Docker containers
@@ -150,8 +162,10 @@ Telegram (telegraf) --> SQLite --> Polling loop --> Intelligent Router
                                                ↓                        ↓
                                     Persistent Container      Dedicated Container
                                     (Main group, simple)      (Complex queries)
-                                               ↓                        ↓
-                                    Claude Agent SDK --> Response
+                                        ↓       ↓                      ↓
+                                   Response   spawn_subagent ──→ Subagent Container
+                                                                       ↓
+                                                              Result → DB → Next Prompt
 ```
 
 Single Node.js process. Agents execute in isolated Linux containers with mounted directories. IPC via filesystem. No daemons, no queues, no complexity.
@@ -160,14 +174,17 @@ Single Node.js process. Agents execute in isolated Linux containers with mounted
 - Persistent container handles simple queries (~6s)
 - Dedicated containers for complex operations (~10s)
 - AI decides routing based on query complexity
+- Subagent results stored in DB, visible to persistent agent in next prompt
 - Other groups use traditional on-demand containers
 
 Key files:
-- `src/index.ts` - Main app: Telegram bot, routing, IPC, intelligent routing
+- `src/index.ts` - Main app: Telegram bot, message merge queue, action executor
+- `src/task-manager.ts` - Container orchestration, IPC handling, scheduler, subagent management
 - `src/main-agent-manager.ts` - Persistent container lifecycle manager
-- `src/container-runner.ts` - Spawns dedicated agent containers
-- `src/task-scheduler.ts` - Runs scheduled tasks
+- `src/container-runner.ts` - Spawns on-demand agent containers (with AbortSignal support)
+- `src/container-common.ts` - Shared Docker volume mount and container arg logic
 - `src/db.ts` - SQLite operations
+- `src/config.ts` - All constants and environment variable parsing
 - `groups/*/CLAUDE.md` - Per-group memory
 
 ## FAQ

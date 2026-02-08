@@ -5,15 +5,11 @@
 
 import { spawn, ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
-import fs from 'fs';
-import path from 'path';
 import {
-  CONTAINER_IMAGE,
-  DATA_DIR,
-  GROUPS_DIR,
   PERSISTENT_HEALTH_CHECK_INTERVAL,
   PERSISTENT_REQUEST_TIMEOUT,
 } from './config.js';
+import { buildVolumeMounts, buildContainerArgs } from './container-common.js';
 import { logger } from './logger.js';
 import { RegisteredGroup, PersistentContainerResponse } from './types.js';
 
@@ -54,9 +50,9 @@ export class MainAgentManager extends EventEmitter {
     logger.info('Starting persistent main agent container...');
 
     try {
-      const mounts = this.buildVolumeMounts();
+      const mounts = this.getVolumeMounts();
       const containerName = `nanoclaw-main-persistent`;
-      const containerArgs = this.buildContainerArgs(mounts, containerName);
+      const containerArgs = this.getContainerArgs(mounts, containerName);
 
       this.container = spawn('docker', containerArgs, {
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -164,98 +160,15 @@ export class MainAgentManager extends EventEmitter {
     logger.info('Persistent main agent shut down');
   }
 
-  private buildVolumeMounts(): Array<{ hostPath: string; containerPath: string; readonly?: boolean }> {
-    const mounts = [];
-    const projectRoot = process.cwd();
-
-    // Main gets entire project root
-    mounts.push({
-      hostPath: projectRoot,
-      containerPath: '/workspace/project',
-      readonly: false,
-    });
-
-    // Main group folder
-    mounts.push({
-      hostPath: path.join(GROUPS_DIR, this.group.folder),
-      containerPath: '/workspace/group',
-      readonly: false,
-    });
-
-    // Sessions directory
-    const groupSessionsDir = path.join(DATA_DIR, 'sessions', this.group.folder, '.claude');
-    fs.mkdirSync(groupSessionsDir, { recursive: true });
-    mounts.push({
-      hostPath: groupSessionsDir,
-      containerPath: '/tmp/claude-home/.claude',
-      readonly: false,
-    });
-
-    // IPC directory
-    const groupIpcDir = path.join(DATA_DIR, 'ipc', this.group.folder);
-    fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
-    fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
-    mounts.push({
-      hostPath: groupIpcDir,
-      containerPath: '/workspace/ipc',
-      readonly: false,
-    });
-
-    // Environment variables
-    const envDir = path.join(DATA_DIR, 'env');
-    fs.mkdirSync(envDir, { recursive: true });
-    const envFile = path.join(projectRoot, '.env');
-    if (fs.existsSync(envFile)) {
-      const envContent = fs.readFileSync(envFile, 'utf-8');
-      const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
-      const filteredLines = envContent.split('\n').filter((line) => {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) return false;
-        return allowedVars.some((v) => trimmed.startsWith(`${v}=`));
-      });
-
-      if (filteredLines.length > 0) {
-        fs.writeFileSync(path.join(envDir, 'env'), filteredLines.join('\n') + '\n');
-        mounts.push({
-          hostPath: envDir,
-          containerPath: '/workspace/env-dir',
-          readonly: true,
-        });
-      }
-    }
-
-    return mounts;
+  private getVolumeMounts() {
+    return buildVolumeMounts(this.group, true);
   }
 
-  private buildContainerArgs(
+  private getContainerArgs(
     mounts: Array<{ hostPath: string; containerPath: string; readonly?: boolean }>,
-    containerName: string
+    containerName: string,
   ): string[] {
-    const args: string[] = ['run', '-i', '--rm', '--name', containerName];
-
-    // Run as host UID/GID
-    const uid = process.getuid?.();
-    const gid = process.getgid?.();
-    if (uid && gid) {
-      args.push('--user', `${uid}:${gid}`);
-      args.push('-e', 'HOME=/tmp/claude-home');
-    }
-
-    // Add persistent mode flag
-    args.push('-e', 'NANOCLAW_PERSISTENT=true');
-
-    // Volume mounts
-    for (const mount of mounts) {
-      if (mount.readonly) {
-        args.push('-v', `${mount.hostPath}:${mount.containerPath}:ro`);
-      } else {
-        args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
-      }
-    }
-
-    args.push(CONTAINER_IMAGE);
-
-    return args;
+    return buildContainerArgs(mounts, containerName, { persistent: true });
   }
 
   private handleStdout(data: Buffer): void {

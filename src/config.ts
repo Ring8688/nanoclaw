@@ -42,6 +42,7 @@ export const TRIGGER_PATTERN = new RegExp(
 );
 
 export const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+export const TELEGRAM_LOCAL_API_URL = process.env.TELEGRAM_LOCAL_API_URL || '';
 
 // Timezone for scheduled tasks (cron expressions, etc.)
 // Uses system timezone by default
@@ -57,3 +58,7 @@ export const PERSISTENT_HEALTH_CHECK_INTERVAL =
 
 export const PERSISTENT_REQUEST_TIMEOUT =
   parseInt(process.env.PERSISTENT_REQUEST_TIMEOUT || '300000', 10);
+
+export const MAX_CONCURRENT_SUBAGENTS = parseInt(
+  process.env.MAX_CONCURRENT_SUBAGENTS || '3', 10
+);

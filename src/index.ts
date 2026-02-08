@@ -1,48 +1,36 @@
 import 'dotenv/config';
-import dns from 'dns';
 import { execSync } from 'child_process';
 import fs from 'fs';
 import https from 'https';
 import path from 'path';
 
 import { Telegraf } from 'telegraf';
-import { message } from 'telegraf/filters';
+import type { Message } from 'telegraf/types';
 
 import {
   ASSISTANT_NAME,
   DATA_DIR,
   ENABLE_PERSISTENT_MAIN,
-  IPC_POLL_INTERVAL,
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
   TELEGRAM_BOT_TOKEN,
-  TIMEZONE,
+  TELEGRAM_LOCAL_API_URL,
   TRIGGER_PATTERN,
 } from './config.js';
 import {
-  AvailableGroup,
-  runContainerAgent,
-  writeGroupsSnapshot,
-  writeTasksSnapshot,
-} from './container-runner.js';
-import {
-  getAllChats,
-  getAllTasks,
   getMessagesSince,
   getNewMessages,
   initDatabase,
   storeChatMetadata,
   storeMessage,
 } from './db.js';
-import { startSchedulerLoop } from './task-scheduler.js';
-import { NewMessage, RegisteredGroup, Session } from './types.js';
-import { loadJson, saveJson } from './utils.js';
+import { downloadFile } from './file-handler.js';
 import { logger } from './logger.js';
-import {
-  initMainAgentManager,
-  getMainAgentManager,
-  shutdownMainAgentManager,
-} from './main-agent-manager.js';
+import { TaskManager } from './task-manager.js';
+import { NewMessage, RegisteredGroup, Session, TelegramFileInfo } from './types.js';
+import { escapeXml, loadJson, saveJson } from './utils.js';
+
+// --- State ---
 
 let bot: Telegraf;
 let lastTimestamp = '';
@@ -50,13 +38,28 @@ let sessions: Session = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let typingIntervals: Record<string, ReturnType<typeof setInterval>> = {};
+let taskManager: TaskManager;
+
+// --- Message merge queue ---
+
+const MERGE_WINDOW = 3000; // 3s interrupt-merge window
+
+interface ActiveRequest {
+  chatJid: string;
+  group: RegisteredGroup;
+  messages: NewMessage[];
+  abortController: AbortController;
+  startedAt: number;
+}
+
+const activeRequests = new Map<string, ActiveRequest>();
+
+// --- Typing indicator ---
 
 async function setTyping(chatId: string, isTyping: boolean): Promise<void> {
   try {
     if (isTyping) {
-      // Send typing action immediately
       await bot.telegram.sendChatAction(chatId, 'typing');
-      // Refresh every 4 seconds (Telegram typing indicator lasts ~5s)
       typingIntervals[chatId] = setInterval(async () => {
         try {
           await bot.telegram.sendChatAction(chatId, 'typing');
@@ -75,214 +78,14 @@ async function setTyping(chatId: string, isTyping: boolean): Promise<void> {
   }
 }
 
-function loadState(): void {
-  const statePath = path.join(DATA_DIR, 'router_state.json');
-  const state = loadJson<{
-    last_timestamp?: string;
-    last_agent_timestamp?: Record<string, string>;
-  }>(statePath, {});
-  lastTimestamp = state.last_timestamp || '';
-  lastAgentTimestamp = state.last_agent_timestamp || {};
-  sessions = loadJson(path.join(DATA_DIR, 'sessions.json'), {});
-  registeredGroups = loadJson(
-    path.join(DATA_DIR, 'registered_groups.json'),
-    {},
-  );
-  logger.info(
-    { groupCount: Object.keys(registeredGroups).length },
-    'State loaded',
-  );
-}
-
-function saveState(): void {
-  saveJson(path.join(DATA_DIR, 'router_state.json'), {
-    last_timestamp: lastTimestamp,
-    last_agent_timestamp: lastAgentTimestamp,
-  });
-  saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
-}
-
-function registerGroup(jid: string, group: RegisteredGroup): void {
-  registeredGroups[jid] = group;
-  saveJson(path.join(DATA_DIR, 'registered_groups.json'), registeredGroups);
-
-  // Create group folder
-  const groupDir = path.join(DATA_DIR, '..', 'groups', group.folder);
-  fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
-
-  logger.info(
-    { jid, name: group.name, folder: group.folder },
-    'Group registered',
-  );
-}
-
-/**
- * Get available groups list for the agent.
- * Returns groups ordered by most recent activity.
- */
-function getAvailableGroups(): AvailableGroup[] {
-  const chats = getAllChats();
-  const registeredJids = new Set(Object.keys(registeredGroups));
-
-  return chats
-    .filter((c) => c.jid !== '__group_sync__')
-    .map((c) => ({
-      jid: c.jid,
-      name: c.name,
-      lastActivity: c.last_message_time,
-      isRegistered: registeredJids.has(c.jid),
-    }));
-}
-
-async function processMessage(msg: NewMessage): Promise<void> {
-  const startTime = Date.now();
-  const group = registeredGroups[msg.chat_jid];
-  if (!group) return;
-
-  const content = msg.content.trim();
-  const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
-
-  // Main group responds to all messages; other groups require trigger prefix
-  if (!isMainGroup && !TRIGGER_PATTERN.test(content)) return;
-
-  // Get all messages since last agent interaction so the session has full context
-  const sinceTimestamp = lastAgentTimestamp[msg.chat_jid] || '';
-  const missedMessages = getMessagesSince(
-    msg.chat_jid,
-    sinceTimestamp,
-    ASSISTANT_NAME,
-  );
-
-  const lines = missedMessages.map((m) => {
-    // Escape XML special characters in content
-    const escapeXml = (s: string) =>
-      s
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
-    return `<message sender="${escapeXml(m.sender_name)}" time="${m.timestamp}">${escapeXml(m.content)}</message>`;
-  });
-  const prompt = `<messages>\n${lines.join('\n')}\n</messages>`;
-
-  if (!prompt) return;
-
-  const prepTime = Date.now() - startTime;
-  logger.info(
-    { group: group.name, messageCount: missedMessages.length, prepTime },
-    'Processing message',
-  );
-
-  await setTyping(msg.chat_jid, true);
-  const agentStartTime = Date.now();
-  const response = await runAgent(group, prompt, msg.chat_jid);
-  const agentTime = Date.now() - agentStartTime;
-  await setTyping(msg.chat_jid, false);
-
-  if (response) {
-    lastAgentTimestamp[msg.chat_jid] = msg.timestamp;
-    const totalTime = Date.now() - startTime;
-    logger.info({ agentTime, totalTime }, 'Message processing complete');
-    await sendMessage(msg.chat_jid, `${ASSISTANT_NAME}: ${response}`);
-  }
-}
-
-async function runAgent(
-  group: RegisteredGroup,
-  prompt: string,
-  chatJid: string,
-): Promise<string | null> {
-  const isMain = group.folder === MAIN_GROUP_FOLDER;
-  const sessionId = sessions[group.folder];
-
-  // Update tasks snapshot for container to read (filtered by group)
-  const tasks = getAllTasks();
-  writeTasksSnapshot(
-    group.folder,
-    isMain,
-    tasks.map((t) => ({
-      id: t.id,
-      groupFolder: t.group_folder,
-      prompt: t.prompt,
-      schedule_type: t.schedule_type,
-      schedule_value: t.schedule_value,
-      status: t.status,
-      next_run: t.next_run,
-    })),
-  );
-
-  // Update available groups snapshot (main group only can see all groups)
-  const availableGroups = getAvailableGroups();
-  writeGroupsSnapshot(
-    group.folder,
-    isMain,
-    availableGroups,
-    new Set(Object.keys(registeredGroups)),
-  );
-
-  // Main group: always route to persistent container (AI decides if subagent needed)
-  if (isMain && ENABLE_PERSISTENT_MAIN) {
-    const manager = getMainAgentManager();
-
-    if (manager) {
-      try {
-        logger.info('Routing to persistent main agent');
-        const response = await manager.query(prompt, sessionId, chatJid);
-
-        if (response.newSessionId) {
-          sessions[group.folder] = response.newSessionId;
-          saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
-        }
-
-        return response.result;
-      } catch (err) {
-        logger.error(
-          { err },
-          'Persistent agent failed, falling back to on-demand container'
-        );
-        // Fall through to on-demand container
-      }
-    }
-  }
-
-  // On-demand container mode (fallback or non-main groups)
-  try {
-    const output = await runContainerAgent(group, {
-      prompt,
-      sessionId,
-      groupFolder: group.folder,
-      chatJid,
-      isMain,
-    });
-
-    if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
-    }
-
-    if (output.status === 'error') {
-      logger.error(
-        { group: group.name, error: output.error },
-        'Container agent error',
-      );
-      return null;
-    }
-
-    return output.result;
-  } catch (err) {
-    logger.error({ group: group.name, err }, 'Agent error');
-    return null;
-  }
-}
+// --- Message sending ---
 
 async function sendMessage(chatId: string, text: string): Promise<void> {
   try {
-    // Telegram has a 4096 character limit per message
     const MAX_LEN = 4096;
     if (text.length <= MAX_LEN) {
       await bot.telegram.sendMessage(chatId, text);
     } else {
-      // Split into chunks at newline boundaries when possible
       let remaining = text;
       while (remaining.length > 0) {
         let chunk: string;
@@ -308,440 +111,196 @@ async function sendMessage(chatId: string, text: string): Promise<void> {
   }
 }
 
-function startIpcWatcher(): void {
-  const ipcBaseDir = path.join(DATA_DIR, 'ipc');
-  fs.mkdirSync(ipcBaseDir, { recursive: true });
+// --- State persistence ---
 
-  const processIpcFiles = async () => {
-    // Scan all group IPC directories (identity determined by directory)
-    let groupFolders: string[];
-    try {
-      groupFolders = fs.readdirSync(ipcBaseDir).filter((f) => {
-        const stat = fs.statSync(path.join(ipcBaseDir, f));
-        return stat.isDirectory() && f !== 'errors';
-      });
-    } catch (err) {
-      logger.error({ err }, 'Error reading IPC base directory');
-      setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
-      return;
-    }
-
-    for (const sourceGroup of groupFolders) {
-      const isMain = sourceGroup === MAIN_GROUP_FOLDER;
-      const messagesDir = path.join(ipcBaseDir, sourceGroup, 'messages');
-      const tasksDir = path.join(ipcBaseDir, sourceGroup, 'tasks');
-
-      // Process messages from this group's IPC directory
-      try {
-        if (fs.existsSync(messagesDir)) {
-          const messageFiles = fs
-            .readdirSync(messagesDir)
-            .filter((f) => f.endsWith('.json'));
-          for (const file of messageFiles) {
-            const filePath = path.join(messagesDir, file);
-            try {
-              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              if (data.type === 'message' && data.chatJid && data.text) {
-                // Authorization: verify this group can send to this chatJid
-                const targetGroup = registeredGroups[data.chatJid];
-                if (
-                  isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup)
-                ) {
-                  await sendMessage(
-                    data.chatJid,
-                    `${ASSISTANT_NAME}: ${data.text}`,
-                  );
-                  logger.info(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'IPC message sent',
-                  );
-                } else {
-                  logger.warn(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'Unauthorized IPC message attempt blocked',
-                  );
-                }
-              }
-              fs.unlinkSync(filePath);
-            } catch (err) {
-              logger.error(
-                { file, sourceGroup, err },
-                'Error processing IPC message',
-              );
-              const errorDir = path.join(ipcBaseDir, 'errors');
-              fs.mkdirSync(errorDir, { recursive: true });
-              fs.renameSync(
-                filePath,
-                path.join(errorDir, `${sourceGroup}-${file}`),
-              );
-            }
-          }
-        }
-      } catch (err) {
-        logger.error(
-          { err, sourceGroup },
-          'Error reading IPC messages directory',
-        );
-      }
-
-      // Process tasks from this group's IPC directory
-      try {
-        if (fs.existsSync(tasksDir)) {
-          const taskFiles = fs
-            .readdirSync(tasksDir)
-            .filter((f) => f.endsWith('.json'));
-          for (const file of taskFiles) {
-            const filePath = path.join(tasksDir, file);
-            try {
-              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              // Pass source group identity to processTaskIpc for authorization
-              await processTaskIpc(data, sourceGroup, isMain);
-              fs.unlinkSync(filePath);
-            } catch (err) {
-              logger.error(
-                { file, sourceGroup, err },
-                'Error processing IPC task',
-              );
-              const errorDir = path.join(ipcBaseDir, 'errors');
-              fs.mkdirSync(errorDir, { recursive: true });
-              fs.renameSync(
-                filePath,
-                path.join(errorDir, `${sourceGroup}-${file}`),
-              );
-            }
-          }
-        }
-      } catch (err) {
-        logger.error({ err, sourceGroup }, 'Error reading IPC tasks directory');
-      }
-    }
-
-    setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
-  };
-
-  processIpcFiles();
-  logger.info('IPC watcher started (per-group namespaces)');
+function loadState(): void {
+  const statePath = path.join(DATA_DIR, 'router_state.json');
+  const state = loadJson<{
+    last_timestamp?: string;
+    last_agent_timestamp?: Record<string, string>;
+  }>(statePath, {});
+  lastTimestamp = state.last_timestamp || '';
+  lastAgentTimestamp = state.last_agent_timestamp || {};
+  sessions = loadJson(path.join(DATA_DIR, 'sessions.json'), {});
+  registeredGroups = loadJson(path.join(DATA_DIR, 'registered_groups.json'), {});
+  logger.info({ groupCount: Object.keys(registeredGroups).length }, 'State loaded');
 }
 
-async function processTaskIpc(
-  data: {
-    type: string;
-    taskId?: string;
-    prompt?: string;
-    schedule_type?: string;
-    schedule_value?: string;
-    context_mode?: string;
-    groupFolder?: string;
-    chatJid?: string;
-    // For register_group
-    jid?: string;
-    name?: string;
-    folder?: string;
-    trigger?: string;
-    containerConfig?: RegisteredGroup['containerConfig'];
-    // For spawn_subagent
-    task?: string;
-    includeContext?: boolean;
-  },
-  sourceGroup: string, // Verified identity from IPC directory
-  isMain: boolean, // Verified from directory path
-): Promise<void> {
-  // Import db functions dynamically to avoid circular deps
-  const {
-    createTask,
-    updateTask,
-    deleteTask,
-    getTaskById: getTask,
-  } = await import('./db.js');
-  const { CronExpressionParser } = await import('cron-parser');
+function saveState(): void {
+  saveJson(path.join(DATA_DIR, 'router_state.json'), {
+    last_timestamp: lastTimestamp,
+    last_agent_timestamp: lastAgentTimestamp,
+  });
+  saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
+}
 
-  switch (data.type) {
-    case 'schedule_task':
-      if (
-        data.prompt &&
-        data.schedule_type &&
-        data.schedule_value &&
-        data.groupFolder
-      ) {
-        // Authorization: non-main groups can only schedule for themselves
-        const targetGroup = data.groupFolder;
-        if (!isMain && targetGroup !== sourceGroup) {
-          logger.warn(
-            { sourceGroup, targetGroup },
-            'Unauthorized schedule_task attempt blocked',
-          );
-          break;
+function registerGroup(jid: string, group: RegisteredGroup): void {
+  registeredGroups[jid] = group;
+  saveJson(path.join(DATA_DIR, 'registered_groups.json'), registeredGroups);
+  const groupDir = path.join(DATA_DIR, '..', 'groups', group.folder);
+  fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
+  logger.info({ jid, name: group.name, folder: group.folder }, 'Group registered');
+}
+
+// --- Prompt building ---
+
+function buildPrompt(messages: NewMessage[]): string {
+  const lines = messages.map((m) => {
+    const msgType = m.message_type || 'text';
+    let messageXml = `<message sender="${escapeXml(m.sender_name)}" time="${m.timestamp}" type="${msgType}">`;
+
+    if (m.quoted_message) {
+      try {
+        const quoted = JSON.parse(m.quoted_message);
+        messageXml += `\n  <quoted sender="${escapeXml(quoted.senderName)}">${escapeXml(quoted.content)}</quoted>`;
+      } catch {
+        // Ignore malformed quoted message
+      }
+    }
+
+    if (m.attachments) {
+      try {
+        const attachments = JSON.parse(m.attachments);
+        for (const att of attachments) {
+          messageXml += `\n  <${att.type} path="${escapeXml(att.filePath)}"`;
+          if (att.fileName) messageXml += ` fileName="${escapeXml(att.fileName)}"`;
+          if (att.fileSize) messageXml += ` fileSize="${att.fileSize}"`;
+          if (att.mimeType) messageXml += ` mimeType="${escapeXml(att.mimeType)}"`;
+          messageXml += ` />`;
         }
-
-        // Resolve the correct JID for the target group (don't trust IPC payload)
-        const targetJid = Object.entries(registeredGroups).find(
-          ([, group]) => group.folder === targetGroup,
-        )?.[0];
-
-        if (!targetJid) {
-          logger.warn(
-            { targetGroup },
-            'Cannot schedule task: target group not registered',
-          );
-          break;
-        }
-
-        const scheduleType = data.schedule_type as 'cron' | 'interval' | 'once';
-
-        let nextRun: string | null = null;
-        if (scheduleType === 'cron') {
-          try {
-            const interval = CronExpressionParser.parse(data.schedule_value, {
-              tz: TIMEZONE,
-            });
-            nextRun = interval.next().toISOString();
-          } catch {
-            logger.warn(
-              { scheduleValue: data.schedule_value },
-              'Invalid cron expression',
-            );
-            break;
-          }
-        } else if (scheduleType === 'interval') {
-          const ms = parseInt(data.schedule_value, 10);
-          if (isNaN(ms) || ms <= 0) {
-            logger.warn(
-              { scheduleValue: data.schedule_value },
-              'Invalid interval',
-            );
-            break;
-          }
-          nextRun = new Date(Date.now() + ms).toISOString();
-        } else if (scheduleType === 'once') {
-          const scheduled = new Date(data.schedule_value);
-          if (isNaN(scheduled.getTime())) {
-            logger.warn(
-              { scheduleValue: data.schedule_value },
-              'Invalid timestamp',
-            );
-            break;
-          }
-          nextRun = scheduled.toISOString();
-        }
-
-        const taskId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        const contextMode =
-          data.context_mode === 'group' || data.context_mode === 'isolated'
-            ? data.context_mode
-            : 'isolated';
-        createTask({
-          id: taskId,
-          group_folder: targetGroup,
-          chat_jid: targetJid,
-          prompt: data.prompt,
-          schedule_type: scheduleType,
-          schedule_value: data.schedule_value,
-          context_mode: contextMode,
-          next_run: nextRun,
-          status: 'active',
-          created_at: new Date().toISOString(),
-        });
-        logger.info(
-          { taskId, sourceGroup, targetGroup, contextMode },
-          'Task created via IPC',
-        );
+      } catch {
+        // Ignore malformed attachments
       }
-      break;
+    }
 
-    case 'pause_task':
-      if (data.taskId) {
-        const task = getTask(data.taskId);
-        if (task && (isMain || task.group_folder === sourceGroup)) {
-          updateTask(data.taskId, { status: 'paused' });
-          logger.info(
-            { taskId: data.taskId, sourceGroup },
-            'Task paused via IPC',
-          );
-        } else {
-          logger.warn(
-            { taskId: data.taskId, sourceGroup },
-            'Unauthorized task pause attempt',
-          );
-        }
-      }
-      break;
+    if (m.content) {
+      messageXml += `\n  ${escapeXml(m.content)}`;
+    }
 
-    case 'resume_task':
-      if (data.taskId) {
-        const task = getTask(data.taskId);
-        if (task && (isMain || task.group_folder === sourceGroup)) {
-          updateTask(data.taskId, { status: 'active' });
-          logger.info(
-            { taskId: data.taskId, sourceGroup },
-            'Task resumed via IPC',
-          );
-        } else {
-          logger.warn(
-            { taskId: data.taskId, sourceGroup },
-            'Unauthorized task resume attempt',
-          );
-        }
-      }
-      break;
+    messageXml += '\n</message>';
+    return messageXml;
+  });
+  return `<messages>\n${lines.join('\n')}\n</messages>`;
+}
 
-    case 'cancel_task':
-      if (data.taskId) {
-        const task = getTask(data.taskId);
-        if (task && (isMain || task.group_folder === sourceGroup)) {
-          deleteTask(data.taskId);
-          logger.info(
-            { taskId: data.taskId, sourceGroup },
-            'Task cancelled via IPC',
-          );
-        } else {
-          logger.warn(
-            { taskId: data.taskId, sourceGroup },
-            'Unauthorized task cancel attempt',
-          );
-        }
-      }
-      break;
+// --- Message processing with merge queue ---
 
-    case 'refresh_groups':
-      // No-op for Telegram - groups are discovered via incoming messages
-      if (isMain) {
-        logger.info(
-          { sourceGroup },
-          'Group refresh requested (no-op for Telegram, groups discovered via messages)',
-        );
-        const availableGroups = getAvailableGroups();
-        const { writeGroupsSnapshot: writeGroups } =
-          await import('./container-runner.js');
-        writeGroups(
-          sourceGroup,
-          true,
-          availableGroups,
-          new Set(Object.keys(registeredGroups)),
-        );
-      } else {
-        logger.warn(
-          { sourceGroup },
-          'Unauthorized refresh_groups attempt blocked',
-        );
-      }
-      break;
+async function handleNewMessage(msg: NewMessage): Promise<void> {
+  const group = registeredGroups[msg.chat_jid];
+  if (!group) return;
 
-    case 'register_group':
-      // Only main group can register new groups
-      if (!isMain) {
-        logger.warn(
-          { sourceGroup },
-          'Unauthorized register_group attempt blocked',
-        );
-        break;
-      }
-      if (data.jid && data.name && data.folder && data.trigger) {
-        registerGroup(data.jid, {
-          name: data.name,
-          folder: data.folder,
-          trigger: data.trigger,
-          added_at: new Date().toISOString(),
-          containerConfig: data.containerConfig,
-        });
-      } else {
-        logger.warn(
-          { data },
-          'Invalid register_group request - missing required fields',
-        );
-      }
-      break;
+  const content = msg.content.trim();
+  const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
 
-    case 'spawn_subagent':
-      // Only main group can spawn subagents
-      if (!isMain) {
-        logger.warn(
-          { sourceGroup },
-          'Unauthorized spawn_subagent attempt blocked',
-        );
-        break;
-      }
-      if (data.task && data.chatJid) {
-        const chatJid = data.chatJid; // Type narrowing
-        const task = data.task;
-        logger.info({ task: task.slice(0, 100) }, 'Spawning subagent from main agent request');
+  if (!isMainGroup && !TRIGGER_PATTERN.test(content)) return;
 
-        // Get group info
-        const targetGroup = registeredGroups[chatJid];
-        if (!targetGroup) {
-          logger.warn({ chatJid }, 'Cannot spawn subagent: group not found');
-          break;
-        }
+  const key = msg.chat_jid;
+  const existing = activeRequests.get(key);
 
-        // Build prompt for subagent
-        let subagentPrompt = task;
-        if (data.includeContext) {
-          // Get recent messages for context
-          const recentMessages = getMessagesSince(
-            chatJid,
-            new Date(Date.now() - 30 * 60 * 1000).toISOString(), // Last 30 minutes
-            ASSISTANT_NAME,
-          ).slice(-10); // Last 10 messages
-
-          if (recentMessages.length > 0) {
-            const escapeXml = (s: string) =>
-              s
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;')
-                .replace(/"/g, '&quot;');
-
-            const contextLines = recentMessages.map((m) =>
-              `<message sender="${escapeXml(m.sender_name)}" time="${m.timestamp}">${escapeXml(m.content)}</message>`
-            );
-            subagentPrompt = `<recent_context>\n${contextLines.join('\n')}\n</recent_context>\n\n${data.task}`;
-          }
-        }
-
-        // Spawn dedicated container (background, non-blocking)
-        (async () => {
-          try {
-            const output = await runContainerAgent(targetGroup, {
-              prompt: subagentPrompt,
-              sessionId: undefined, // Fresh session for subagent
-              groupFolder: targetGroup.folder,
-              chatJid,
-              isMain: true,
-            });
-
-            // Send result back via Telegram
-            if (output.status === 'success' && output.result) {
-              await sendMessage(chatJid, `${ASSISTANT_NAME}: ${output.result}`);
-              logger.info('Subagent completed and result sent');
-            } else {
-              logger.error({ error: output.error }, 'Subagent failed');
-              await sendMessage(
-                chatJid,
-                `${ASSISTANT_NAME}: Subagent encountered an error: ${output.error || 'Unknown error'}`
-              );
-            }
-          } catch (err) {
-            logger.error({ err }, 'Error running subagent');
-            await sendMessage(
-              chatJid,
-              `${ASSISTANT_NAME}: Failed to run subagent: ${err instanceof Error ? err.message : String(err)}`
-            );
-          }
-        })();
-
-        logger.info('Subagent task queued (running in background)');
-      } else {
-        logger.warn(
-          { data },
-          'Invalid spawn_subagent request - missing task or chatJid',
-        );
-      }
-      break;
-
-    default:
-      logger.warn({ type: data.type }, 'Unknown IPC task type');
+  if (existing && Date.now() - existing.startedAt < MERGE_WINDOW) {
+    // Within merge window → abort current request + subagents, merge messages
+    logger.info({ chatJid: key, mergedCount: existing.messages.length + 1 }, 'Merging message into active request');
+    existing.abortController.abort();
+    taskManager.cancelSubagentsForChat(key);
+    existing.messages.push(msg);
+    startAgentRequest(key, group, existing.messages);
+  } else {
+    // No active request or past merge window → start new request
+    startAgentRequest(key, group, [msg]);
   }
 }
+
+function startAgentRequest(
+  chatJid: string,
+  group: RegisteredGroup,
+  messages: NewMessage[],
+): void {
+  const abortController = new AbortController();
+  activeRequests.set(chatJid, {
+    chatJid,
+    group,
+    messages,
+    abortController,
+    startedAt: Date.now(),
+  });
+
+  const isMain = group.folder === MAIN_GROUP_FOLDER;
+  const startTime = Date.now();
+
+  // Fire and forget - errors handled internally
+  (async () => {
+    try {
+      // Get all messages since last agent interaction for full context
+      const latestMsg = messages[messages.length - 1];
+      const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
+      const missedMessages = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
+
+      if (missedMessages.length === 0) return;
+
+      const prompt = buildPrompt(missedMessages);
+      if (!prompt) return;
+
+      const prepTime = Date.now() - startTime;
+      logger.info(
+        { group: group.name, messageCount: missedMessages.length, prepTime },
+        'Processing message',
+      );
+
+      await setTyping(chatJid, true);
+      const agentStartTime = Date.now();
+
+      const result = await taskManager.processAgentRequest(
+        {
+          group,
+          prompt,
+          sessionId: sessions[group.folder],
+          chatJid,
+          isMain,
+        },
+        abortController.signal,
+      );
+
+      if (!abortController.signal.aborted) {
+        const agentTime = Date.now() - agentStartTime;
+        if (result.response) {
+          lastAgentTimestamp[chatJid] = latestMsg.timestamp;
+          const totalTime = Date.now() - startTime;
+          logger.info({ agentTime, totalTime }, 'Message processing complete');
+          await sendMessage(chatJid, `${ASSISTANT_NAME}: ${result.response}`);
+        }
+      }
+    } catch (err) {
+      if (!abortController.signal.aborted) {
+        logger.error({ err, chatJid }, 'Error in agent request');
+      }
+    } finally {
+      if (!abortController.signal.aborted) {
+        activeRequests.delete(chatJid);
+        await setTyping(chatJid, false);
+        saveState();
+      }
+    }
+  })();
+}
+
+// --- File download helper (uses bot for getFile, then delegates to file-handler) ---
+
+async function downloadTelegramFile(
+  fileId: string,
+  chatId: string,
+  type: string,
+): Promise<string> {
+  const file = await bot.telegram.getFile(fileId);
+  const fileInfo: TelegramFileInfo = {
+    file_id: file.file_id,
+    file_unique_id: file.file_unique_id,
+    file_path: file.file_path,
+  };
+  const result = await downloadFile(fileInfo, chatId, type);
+  return result.localPath;
+}
+
+// --- Telegram connection ---
 
 async function connectTelegram(): Promise<void> {
   if (!TELEGRAM_BOT_TOKEN) {
@@ -770,13 +329,15 @@ async function connectTelegram(): Promise<void> {
     process.exit(1);
   }
 
-  // Force IPv4 to avoid IPv6 connectivity issues with Telegram API
   const agent = new https.Agent({ family: 4 });
-  bot = new Telegraf(TELEGRAM_BOT_TOKEN, {
-    telegram: { agent },
-  });
+  const telegramOpts: { agent: https.Agent; apiRoot?: string } = { agent };
+  if (TELEGRAM_LOCAL_API_URL) {
+    telegramOpts.apiRoot = TELEGRAM_LOCAL_API_URL;
+    logger.info({ apiRoot: TELEGRAM_LOCAL_API_URL }, 'Using local Telegram Bot API server');
+  }
+  bot = new Telegraf(TELEGRAM_BOT_TOKEN, { telegram: telegramOpts });
 
-  // /start command - register the current chat as the main group if none exists
+  // /start command
   bot.command('start', async (ctx) => {
     const chatId = String(ctx.chat.id);
     const chatName =
@@ -798,52 +359,187 @@ async function connectTelegram(): Promise<void> {
     } else if (registeredGroups[chatId]) {
       await ctx.reply('This chat is already registered.');
     } else {
-      await ctx.reply(
-        `This chat is not registered. Use the main group to register new chats.`,
-      );
+      await ctx.reply('This chat is not registered. Use the main group to register new chats.');
     }
   });
 
-  // Handle text messages
-  bot.on(message('text'), async (ctx) => {
+  // Handle all message types
+  bot.on('message', async (ctx) => {
     const chatId = String(ctx.chat.id);
     const msgId = String(ctx.message.message_id);
-    const text = ctx.message.text;
     const timestamp = new Date(ctx.message.date * 1000).toISOString();
     const isFromMe = ctx.message.from?.id === ctx.botInfo.id;
 
-    // Determine sender info
     const from = ctx.message.from;
     const sender = from ? String(from.id) : chatId;
-    const senderName =
-      from?.first_name ||
-      from?.username ||
-      sender;
+    const senderName = from?.first_name || from?.username || sender;
 
-    // Determine chat name
     let chatName: string;
     if (ctx.chat.type === 'private') {
-      chatName =
-        (ctx.chat as any).first_name ||
-        (ctx.chat as any).username ||
-        chatId;
+      chatName = (ctx.chat as any).first_name || (ctx.chat as any).username || chatId;
     } else {
       chatName = (ctx.chat as any).title || chatId;
     }
 
-    // Store chat metadata for group discovery
     storeChatMetadata(chatId, timestamp, chatName);
 
-    // Store full message for registered groups
+    let messageType = 'text';
+    let content = '';
+    let attachments: Array<{
+      type: string;
+      filePath: string;
+      fileName?: string;
+      fileSize?: number;
+      mimeType?: string;
+    }> = [];
+    let quotedMessage: {
+      messageId: string;
+      senderName: string;
+      content: string;
+      timestamp: string;
+    } | undefined;
+
+    const msg = ctx.message as Message;
+
+    // Handle quoted/replied messages
+    if ('reply_to_message' in msg && msg.reply_to_message) {
+      const replyMsg = msg.reply_to_message;
+      const replyFrom = 'from' in replyMsg ? replyMsg.from : undefined;
+      const replySender = replyFrom?.first_name || replyFrom?.username || 'Unknown';
+      let replyContent = '';
+
+      if ('text' in replyMsg) {
+        replyContent = replyMsg.text || '';
+      } else if ('caption' in replyMsg) {
+        replyContent = replyMsg.caption || '';
+      } else {
+        replyContent = '[Media message]';
+      }
+
+      quotedMessage = {
+        messageId: String(replyMsg.message_id),
+        senderName: replySender,
+        content: replyContent,
+        timestamp: new Date(replyMsg.date * 1000).toISOString(),
+      };
+    }
+
+    // Process different message types
+    try {
+      const MAX_FILE_SIZE = TELEGRAM_LOCAL_API_URL
+        ? 2000 * 1024 * 1024
+        : 20 * 1024 * 1024;
+
+      if ('photo' in msg && msg.photo) {
+        messageType = 'photo';
+        content = ('caption' in msg && msg.caption) || '';
+        const largestPhoto = msg.photo[msg.photo.length - 1];
+        if (largestPhoto.file_size && largestPhoto.file_size <= MAX_FILE_SIZE) {
+          try {
+            const filePath = await downloadTelegramFile(largestPhoto.file_id, chatId, 'photo');
+            attachments.push({ type: 'photo', filePath, fileSize: largestPhoto.file_size });
+          } catch (err) {
+            logger.error({ err, msgId }, 'Failed to download photo');
+            content = '[Failed to download photo]\n' + content;
+          }
+        }
+      } else if ('document' in msg && msg.document) {
+        messageType = 'document';
+        content = ('caption' in msg && msg.caption) || '';
+        if (msg.document.file_size && msg.document.file_size <= MAX_FILE_SIZE) {
+          try {
+            const filePath = await downloadTelegramFile(msg.document.file_id, chatId, 'document');
+            attachments.push({
+              type: 'document',
+              filePath,
+              fileName: msg.document.file_name,
+              fileSize: msg.document.file_size,
+              mimeType: msg.document.mime_type,
+            });
+          } catch (err) {
+            logger.error({ err, msgId }, 'Failed to download document');
+            content = '[Failed to download document]\n' + content;
+          }
+        }
+      } else if ('video' in msg && msg.video) {
+        messageType = 'video';
+        content = ('caption' in msg && msg.caption) || '';
+        if (msg.video.file_size && msg.video.file_size <= MAX_FILE_SIZE) {
+          try {
+            const filePath = await downloadTelegramFile(msg.video.file_id, chatId, 'video');
+            attachments.push({
+              type: 'video',
+              filePath,
+              fileSize: msg.video.file_size,
+              mimeType: msg.video.mime_type,
+            });
+          } catch (err) {
+            logger.error({ err, msgId }, 'Failed to download video');
+            content = '[Failed to download video]\n' + content;
+          }
+        }
+      } else if ('audio' in msg && msg.audio) {
+        messageType = 'audio';
+        content = ('caption' in msg && msg.caption) || '';
+        if (msg.audio.file_size && msg.audio.file_size <= MAX_FILE_SIZE) {
+          try {
+            const filePath = await downloadTelegramFile(msg.audio.file_id, chatId, 'audio');
+            attachments.push({
+              type: 'audio',
+              filePath,
+              fileName: msg.audio.file_name,
+              fileSize: msg.audio.file_size,
+              mimeType: msg.audio.mime_type,
+            });
+          } catch (err) {
+            logger.error({ err, msgId }, 'Failed to download audio');
+            content = '[Failed to download audio]\n' + content;
+          }
+        }
+      } else if ('voice' in msg && msg.voice) {
+        messageType = 'voice';
+        content = ('caption' in msg && msg.caption) || '';
+        if (msg.voice.file_size && msg.voice.file_size <= MAX_FILE_SIZE) {
+          try {
+            const filePath = await downloadTelegramFile(msg.voice.file_id, chatId, 'voice');
+            attachments.push({
+              type: 'voice',
+              filePath,
+              fileSize: msg.voice.file_size,
+              mimeType: msg.voice.mime_type,
+            });
+          } catch (err) {
+            logger.error({ err, msgId }, 'Failed to download voice');
+            content = '[Failed to download voice]\n' + content;
+          }
+        }
+      } else if ('sticker' in msg && msg.sticker) {
+        messageType = 'sticker';
+        content = msg.sticker.emoji || '[Sticker]';
+      } else if ('text' in msg) {
+        messageType = 'text';
+        content = msg.text || '';
+      } else {
+        logger.debug({ msgId, messageKeys: Object.keys(msg) }, 'Unknown message type');
+        return;
+      }
+    } catch (err) {
+      logger.error({ err, msgId }, 'Error processing message');
+      content = content || '[Error processing message]';
+    }
+
     if (registeredGroups[chatId]) {
       storeMessage(
         msgId,
         chatId,
         sender,
         senderName,
-        text,
+        content,
         timestamp,
         isFromMe,
+        messageType,
+        attachments.length > 0 ? attachments : undefined,
+        quotedMessage,
       );
     }
   });
@@ -851,14 +547,14 @@ async function connectTelegram(): Promise<void> {
   // Graceful shutdown
   const stop = async (signal: string) => {
     logger.info({ signal }, 'Shutting down...');
-    await shutdownMainAgentManager();
+    await taskManager.shutdown();
     bot.stop(signal);
     process.exit(0);
   };
   process.once('SIGINT', () => stop('SIGINT'));
   process.once('SIGTERM', () => stop('SIGTERM'));
 
-  // Launch the bot step by step (bot.launch() hangs on some environments)
+  // Launch bot
   logger.info('Connecting to Telegram...');
   bot.botInfo = await bot.telegram.getMe();
   logger.info({ id: bot.botInfo.id, username: bot.botInfo.username }, 'Bot identity confirmed');
@@ -866,20 +562,17 @@ async function connectTelegram(): Promise<void> {
   await bot.telegram.deleteWebhook({ drop_pending_updates: true });
   logger.info('Webhook cleared');
 
-  // Start polling directly - accessing private method to avoid launch() hanging
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (bot as any).startPolling();
   logger.info('Connected to Telegram (polling started)');
 
   // Start subsystems
-  startSchedulerLoop({
-    sendMessage,
-    registeredGroups: () => registeredGroups,
-    getSessions: () => sessions,
-  });
-  startIpcWatcher();
+  taskManager.startIpcWatcher();
+  taskManager.startScheduler();
   startMessageLoop();
 }
+
+// --- Message loop ---
 
 async function startMessageLoop(): Promise<void> {
   logger.info(`NanoClaw running (trigger: @${ASSISTANT_NAME})`);
@@ -894,16 +587,11 @@ async function startMessageLoop(): Promise<void> {
       for (const msg of messages) {
         try {
           logger.info({ chatJid: msg.chat_jid, content: msg.content.slice(0, 50), id: msg.id }, 'Processing message');
-          await processMessage(msg);
-          // Only advance timestamp after successful processing for at-least-once delivery
+          await handleNewMessage(msg);
           lastTimestamp = msg.timestamp;
           saveState();
         } catch (err) {
-          logger.error(
-            { err, msg: msg.id },
-            'Error processing message, will retry',
-          );
-          // Stop processing this batch - failed message will be retried next loop
+          logger.error({ err, msg: msg.id }, 'Error processing message, will retry');
           break;
         }
       }
@@ -913,6 +601,8 @@ async function startMessageLoop(): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
   }
 }
+
+// --- Docker check ---
 
 function ensureDockerRunning(): void {
   try {
@@ -951,10 +641,7 @@ function ensureDockerRunning(): void {
   try {
     const output = execSync(
       'docker ps -a --filter "name=nanoclaw-" --format "{{.Names}}"',
-      {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        encoding: 'utf-8',
-      },
+      { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
     );
     const stale = output
       .split('\n')
@@ -969,6 +656,8 @@ function ensureDockerRunning(): void {
   }
 }
 
+// --- Main ---
+
 async function main(): Promise<void> {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   ensureDockerRunning();
@@ -976,14 +665,68 @@ async function main(): Promise<void> {
   logger.info('Database initialized');
   loadState();
 
+  // Initialize task manager
+  taskManager = new TaskManager({
+    getRegisteredGroups: () => registeredGroups,
+    getSessions: () => sessions,
+    updateSession: (folder, sessionId) => {
+      sessions[folder] = sessionId;
+      saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
+    },
+  });
+
+  // Listen for task-manager actions → execute on Telegram
+  taskManager.on('action', async (event) => {
+    switch (event.type) {
+      case 'send_message':
+        await sendMessage(event.chatJid, event.text);
+        break;
+      case 'update_session':
+        sessions[event.folder] = event.sessionId;
+        saveState();
+        break;
+      case 'typing_start':
+        await setTyping(event.chatJid, true);
+        break;
+      case 'typing_stop':
+        await setTyping(event.chatJid, false);
+        break;
+      case 'subagent_result': {
+        const fullText = `${ASSISTANT_NAME}: ${event.text}`;
+        await sendMessage(event.chatJid, fullText);
+        // Store in DB with [Subagent] sender — content does NOT start with "Momo:"
+        // so it will appear in getMessagesSince() for the persistent agent's next prompt
+        storeMessage(
+          `subagent-${Date.now()}`,
+          event.chatJid,
+          'bot-subagent',
+          '[Subagent]',
+          `[Task: ${event.task}]\n${event.text}`,
+          new Date().toISOString(),
+          true,
+          'text',
+        );
+        break;
+      }
+      case 'register_group':
+        registerGroup(event.jid, {
+          name: event.name,
+          folder: event.folder,
+          trigger: event.trigger,
+          added_at: new Date().toISOString(),
+          containerConfig: event.containerConfig,
+        });
+        break;
+    }
+  });
+
   // Initialize persistent main agent if configured
   const mainGroupJid = Object.entries(registeredGroups).find(
-    ([, group]) => group.folder === MAIN_GROUP_FOLDER
+    ([, group]) => group.folder === MAIN_GROUP_FOLDER,
   )?.[0];
 
   if (mainGroupJid && ENABLE_PERSISTENT_MAIN) {
-    logger.info('Initializing persistent main agent...');
-    initMainAgentManager(registeredGroups[mainGroupJid]);
+    taskManager.initPersistentAgent(registeredGroups[mainGroupJid]);
   }
 
   await connectTelegram();

@@ -12,12 +12,15 @@ Single Node.js process that connects to Telegram, routes messages to Claude Agen
 
 | File | Purpose |
 |------|---------|
-| `src/index.ts` | Main app: Telegram connection, message routing, IPC, intelligent routing |
+| `src/index.ts` | Main process: Telegram I/O, message merge queue, action executor |
+| `src/task-manager.ts` | Container orchestration, IPC handling, agent routing, scheduler |
+| `src/file-handler.ts` | File download module (no bot instance) |
+| `src/container-common.ts` | Shared Docker volume mount and container arg logic |
+| `src/container-runner.ts` | Spawns on-demand agent containers |
+| `src/main-agent-manager.ts` | Persistent container lifecycle for Main group |
 | `src/config.ts` | Trigger pattern, paths, intervals, persistent container config |
-| `src/container-runner.ts` | Spawns agent containers with mounts (traditional mode) |
-| `src/main-agent-manager.ts` | Persistent container lifecycle for Main group (hybrid optimization) |
-| `src/task-scheduler.ts` | Runs scheduled tasks |
 | `src/db.ts` | SQLite operations |
+| `src/types.ts` | Shared type definitions |
 | `groups/{name}/CLAUDE.md` | Per-group memory (isolated) |
 
 ## Skills
@@ -27,6 +30,8 @@ Single Node.js process that connects to Telegram, routes messages to Claude Agen
 | `/setup` | First-time installation, authentication, service configuration |
 | `/customize` | Adding channels, integrations, changing behavior |
 | `/debug` | Container issues, logs, troubleshooting |
+| `/optimize-performance-hybrid` | Configure and troubleshoot hybrid architecture |
+| `/subagent-improvements` | Subagent result feedback, cancellation, concurrency |
 
 ## Development
 
@@ -67,3 +72,21 @@ ENABLE_PERSISTENT_MAIN=false # Disable for full rollback
 ```
 
 Fallback strategy: If persistent container crashes 3+ times, automatically falls back to traditional mode.
+
+## Subagent System
+
+Persistent Main agent can spawn independent Docker containers for complex tasks via `spawn_subagent` MCP tool. Key behaviors:
+
+- **Result feedback**: Subagent results stored in DB (`[Subagent]` sender, `[Task: ...]` prefix) and auto-injected into the persistent agent's next prompt context
+- **Typing indicator**: Shown during subagent execution (typing_start/typing_stop events)
+- **Cancellation**: Message merge (3s window) aborts running subagents via AbortSignal → `docker stop`
+- **Session continuity**: Subagents receive and save the group's session ID
+- **Concurrency limit**: Max 3 concurrent subagents (`MAX_CONCURRENT_SUBAGENTS` env var)
+
+### Event Flow
+```
+TaskManager emits → index.ts handles:
+  subagent_result  → sendMessage() + storeMessage() to DB
+  typing_start     → setTyping(chatJid, true)
+  typing_stop      → setTyping(chatJid, false)
+```

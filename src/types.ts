@@ -45,6 +45,22 @@ export interface Session {
   [folder: string]: string;
 }
 
+export interface MessageAttachment {
+  type: string;
+  filePath: string;
+  fileName?: string;
+  fileSize?: number;
+  caption?: string;
+  mimeType?: string;
+}
+
+export interface QuotedMessage {
+  messageId: string;
+  senderName: string;
+  content: string;
+  timestamp: string;
+}
+
 export interface NewMessage {
   id: string;
   chat_jid: string;
@@ -52,6 +68,9 @@ export interface NewMessage {
   sender_name: string;
   content: string;
   timestamp: string;
+  message_type?: string;
+  attachments?: string; // JSON string in DB
+  quoted_message?: string; // JSON string in DB
 }
 
 export interface ScheduledTask {
@@ -98,4 +117,44 @@ export interface PersistentContainerResponse {
   result: string | null;
   newSessionId?: string;
   error?: string;
+}
+
+// --- Task Manager types ---
+
+/** Events emitted by TaskManager for main process to execute */
+export type TaskManagerEvent =
+  | { type: 'send_message'; chatJid: string; text: string }
+  | { type: 'subagent_result'; chatJid: string; text: string; task: string }
+  | { type: 'typing_start'; chatJid: string }
+  | { type: 'typing_stop'; chatJid: string }
+  | { type: 'update_session'; folder: string; sessionId: string }
+  | { type: 'register_group'; jid: string; name: string; folder: string; trigger: string; containerConfig?: ContainerConfig };
+
+/** Request from main process to task-manager */
+export interface AgentRequest {
+  group: RegisteredGroup;
+  prompt: string;
+  sessionId?: string;
+  chatJid: string;
+  isMain: boolean;
+}
+
+/** Result returned from task-manager to main process */
+export interface AgentResult {
+  response: string | null;
+  newSessionId?: string;
+}
+
+/** File download info passed from main process to file-handler */
+export interface TelegramFileInfo {
+  file_id: string;
+  file_unique_id: string;
+  file_path?: string;
+  file_size?: number;
+}
+
+/** Result of a file download */
+export interface DownloadResult {
+  localPath: string;
+  fileName: string;
 }

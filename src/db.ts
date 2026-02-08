@@ -75,6 +75,25 @@ export function initDatabase(): void {
   } catch {
     /* column already exists */
   }
+
+  // Add multimedia message support columns (migration for existing DBs)
+  try {
+    db.exec(`ALTER TABLE messages ADD COLUMN message_type TEXT DEFAULT 'text'`);
+  } catch {
+    /* column already exists */
+  }
+
+  try {
+    db.exec(`ALTER TABLE messages ADD COLUMN attachments TEXT`);
+  } catch {
+    /* column already exists */
+  }
+
+  try {
+    db.exec(`ALTER TABLE messages ADD COLUMN quoted_message TEXT`);
+  } catch {
+    /* column already exists */
+  }
 }
 
 /**
@@ -108,20 +127,6 @@ export function storeChatMetadata(
   }
 }
 
-/**
- * Update chat name without changing timestamp for existing chats.
- * New chats get the current time as their initial timestamp.
- * Used during group metadata sync.
- */
-export function updateChatName(chatJid: string, name: string): void {
-  db.prepare(
-    `
-    INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
-    ON CONFLICT(jid) DO UPDATE SET name = excluded.name
-  `,
-  ).run(chatJid, name, new Date().toISOString());
-}
-
 export interface ChatInfo {
   jid: string;
   name: string;
@@ -144,27 +149,6 @@ export function getAllChats(): ChatInfo[] {
 }
 
 /**
- * Get timestamp of last group metadata sync.
- */
-export function getLastGroupSync(): string | null {
-  // Store sync time in a special chat entry
-  const row = db
-    .prepare(`SELECT last_message_time FROM chats WHERE jid = '__group_sync__'`)
-    .get() as { last_message_time: string } | undefined;
-  return row?.last_message_time || null;
-}
-
-/**
- * Record that group metadata was synced.
- */
-export function setLastGroupSync(): void {
-  const now = new Date().toISOString();
-  db.prepare(
-    `INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES ('__group_sync__', '__group_sync__', ?)`,
-  ).run(now);
-}
-
-/**
  * Store a message with full content.
  * Only call this for registered groups where message history is needed.
  */
@@ -176,9 +160,12 @@ export function storeMessage(
   content: string,
   timestamp: string,
   isFromMe: boolean,
+  messageType: string = 'text',
+  attachments?: Array<unknown>,
+  quotedMessage?: unknown,
 ): void {
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, message_type, attachments, quoted_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     msgId,
     chatJid,
@@ -187,6 +174,9 @@ export function storeMessage(
     content,
     timestamp,
     isFromMe ? 1 : 0,
+    messageType,
+    attachments ? JSON.stringify(attachments) : null,
+    quotedMessage ? JSON.stringify(quotedMessage) : null,
   );
 }
 
@@ -198,11 +188,12 @@ export function getNewMessages(
   if (jids.length === 0) return { messages: [], newTimestamp: lastTimestamp };
 
   const placeholders = jids.map(() => '?').join(',');
-  // Filter out bot's own messages by checking content prefix (not is_from_me, since user shares the account)
+  // Filter out bot's own messages: is_from_me = 0 excludes subagent results stored in DB,
+  // content NOT LIKE filters any bot messages that got stored without is_from_me flag
   const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp
+    SELECT id, chat_jid, sender, sender_name, content, timestamp, message_type, attachments, quoted_message
     FROM messages
-    WHERE timestamp > ? AND chat_jid IN (${placeholders}) AND content NOT LIKE ?
+    WHERE timestamp > ? AND chat_jid IN (${placeholders}) AND content NOT LIKE ? AND is_from_me = 0
     ORDER BY timestamp
   `;
 
@@ -225,7 +216,7 @@ export function getMessagesSince(
 ): NewMessage[] {
   // Filter out bot's own messages by checking content prefix
   const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp
+    SELECT id, chat_jid, sender, sender_name, content, timestamp, message_type, attachments, quoted_message
     FROM messages
     WHERE chat_jid = ? AND timestamp > ? AND content NOT LIKE ?
     ORDER BY timestamp
@@ -261,14 +252,6 @@ export function getTaskById(id: string): ScheduledTask | undefined {
   return db.prepare('SELECT * FROM scheduled_tasks WHERE id = ?').get(id) as
     | ScheduledTask
     | undefined;
-}
-
-export function getTasksForGroup(groupFolder: string): ScheduledTask[] {
-  return db
-    .prepare(
-      'SELECT * FROM scheduled_tasks WHERE group_folder = ? ORDER BY created_at DESC',
-    )
-    .all(groupFolder) as ScheduledTask[];
 }
 
 export function getAllTasks(): ScheduledTask[] {

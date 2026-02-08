@@ -4,33 +4,21 @@
  */
 import { exec, spawn } from 'child_process';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 
 import {
-  CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
   DATA_DIR,
   GROUPS_DIR,
 } from './config.js';
+import { buildVolumeMounts, buildContainerArgs } from './container-common.js';
 import { logger } from './logger.js';
-import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
-
-function getHomeDir(): string {
-  const home = process.env.HOME || os.homedir();
-  if (!home) {
-    throw new Error(
-      'Unable to determine home directory: HOME environment variable is not set and os.homedir() returned empty',
-    );
-  }
-  return home;
-}
 
 export interface ContainerInput {
   prompt: string;
@@ -48,152 +36,10 @@ export interface ContainerOutput {
   error?: string;
 }
 
-interface VolumeMount {
-  hostPath: string;
-  containerPath: string;
-  readonly?: boolean;
-}
-
-function buildVolumeMounts(
-  group: RegisteredGroup,
-  isMain: boolean,
-): VolumeMount[] {
-  const mounts: VolumeMount[] = [];
-  const homeDir = getHomeDir();
-  const projectRoot = process.cwd();
-
-  if (isMain) {
-    // Main gets the entire project root mounted
-    mounts.push({
-      hostPath: projectRoot,
-      containerPath: '/workspace/project',
-      readonly: false,
-    });
-
-    // Main also gets its group folder as the working directory
-    mounts.push({
-      hostPath: path.join(GROUPS_DIR, group.folder),
-      containerPath: '/workspace/group',
-      readonly: false,
-    });
-  } else {
-    // Other groups only get their own folder
-    mounts.push({
-      hostPath: path.join(GROUPS_DIR, group.folder),
-      containerPath: '/workspace/group',
-      readonly: false,
-    });
-
-    // Global memory directory (read-only for non-main)
-    // Docker bind mounts work with both files and directories
-    const globalDir = path.join(GROUPS_DIR, 'global');
-    if (fs.existsSync(globalDir)) {
-      mounts.push({
-        hostPath: globalDir,
-        containerPath: '/workspace/global',
-        readonly: true,
-      });
-    }
-  }
-
-  // Per-group Claude sessions directory (isolated from other groups)
-  // Each group gets their own .claude/ to prevent cross-group session access
-  const groupSessionsDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    '.claude',
-  );
-  fs.mkdirSync(groupSessionsDir, { recursive: true });
-  mounts.push({
-    hostPath: groupSessionsDir,
-    containerPath: '/tmp/claude-home/.claude',
-    readonly: false,
-  });
-
-  // Per-group IPC namespace: each group gets its own IPC directory
-  // This prevents cross-group privilege escalation via IPC
-  const groupIpcDir = path.join(DATA_DIR, 'ipc', group.folder);
-  fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
-  fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
-  mounts.push({
-    hostPath: groupIpcDir,
-    containerPath: '/workspace/ipc',
-    readonly: false,
-  });
-
-  // Environment file directory (keeps credentials out of process listings)
-  // Only expose specific auth variables needed by Claude Code, not the entire .env
-  const envDir = path.join(DATA_DIR, 'env');
-  fs.mkdirSync(envDir, { recursive: true });
-  const envFile = path.join(projectRoot, '.env');
-  if (fs.existsSync(envFile)) {
-    const envContent = fs.readFileSync(envFile, 'utf-8');
-    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
-    const filteredLines = envContent.split('\n').filter((line) => {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) return false;
-      return allowedVars.some((v) => trimmed.startsWith(`${v}=`));
-    });
-
-    if (filteredLines.length > 0) {
-      fs.writeFileSync(
-        path.join(envDir, 'env'),
-        filteredLines.join('\n') + '\n',
-      );
-      mounts.push({
-        hostPath: envDir,
-        containerPath: '/workspace/env-dir',
-        readonly: true,
-      });
-    }
-  }
-
-  // Additional mounts validated against external allowlist (tamper-proof from containers)
-  if (group.containerConfig?.additionalMounts) {
-    const validatedMounts = validateAdditionalMounts(
-      group.containerConfig.additionalMounts,
-      group.name,
-      isMain,
-    );
-    mounts.push(...validatedMounts);
-  }
-
-  return mounts;
-}
-
-function buildContainerArgs(mounts: VolumeMount[], containerName: string): string[] {
-  const args: string[] = ['run', '-i', '--rm', '--name', containerName];
-
-  // Run container as host UID/GID so bind-mounted directories have correct permissions.
-  // The container's Dockerfile USER (node:1000) may differ from the host user.
-  // Claude Code SDK requires non-root, which this satisfies as long as host isn't root.
-  const uid = process.getuid?.();
-  const gid = process.getgid?.();
-  if (uid && gid) {
-    args.push('--user', `${uid}:${gid}`);
-    // Use /tmp/claude-home as HOME to avoid /home/node permission issues
-    // (UID 1001 cannot write to /home/node owned by node:1000)
-    args.push('-e', 'HOME=/tmp/claude-home');
-  }
-
-  // Docker: -v with :ro suffix for readonly
-  for (const mount of mounts) {
-    if (mount.readonly) {
-      args.push('-v', `${mount.hostPath}:${mount.containerPath}:ro`);
-    } else {
-      args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
-    }
-  }
-
-  args.push(CONTAINER_IMAGE);
-
-  return args;
-}
-
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
+  signal?: AbortSignal,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
 
@@ -294,9 +140,37 @@ export async function runContainerAgent(
       });
     }, group.containerConfig?.timeout || CONTAINER_TIMEOUT);
 
+    // Abort signal support: stop container on external cancellation
+    let aborted = false;
+    const onAbort = () => {
+      aborted = true;
+      logger.info({ group: group.name, containerName }, 'Container aborted via signal');
+      exec(`docker stop ${containerName}`, { timeout: 15000 }, (err) => {
+        if (err) {
+          container.kill('SIGKILL');
+        }
+      });
+    };
+    if (signal?.aborted) {
+      onAbort();
+    } else {
+      signal?.addEventListener('abort', onAbort, { once: true });
+    }
+
     container.on('close', (code) => {
+      signal?.removeEventListener('abort', onAbort);
       clearTimeout(timeout);
       const duration = Date.now() - startTime;
+
+      if (aborted) {
+        logger.info({ group: group.name, containerName, duration }, 'Container stopped (aborted)');
+        resolve({
+          status: 'error',
+          result: null,
+          error: 'Container aborted',
+        });
+        return;
+      }
 
       if (timedOut) {
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
